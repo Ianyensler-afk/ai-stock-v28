@@ -4,7 +4,7 @@ import logging
 # 忽略 Streamlit 多執行緒的 Context 警告 (因為我們只做純運算，這是安全的)
 logging.getLogger('streamlit.runtime.scriptrunner_utils.script_run_context').setLevel(logging.ERROR)
 logging.getLogger('streamlit.runtime.scriptrunner.script_run_context').setLevel(logging.ERROR)
-import google.generativeai as genai
+
 # ... (接著原本的 import streamlit as st 等等) ...
 import streamlit as st
 import yfinance as yf
@@ -22,6 +22,8 @@ from concurrent.futures import ThreadPoolExecutor
 from scipy.signal import argrelextrema 
 import json
 import smtplib
+import google.generativeai as genai
+import os
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -1083,6 +1085,9 @@ def page_ai_selector():
 
 # --- Page 2: 全能達人戰情室 (V32.0 Gemini 整合版) ---
 def page_dashboard():
+    # --- 除錯用 (測試完請刪除) ---
+    st.write("目前 Secrets 裡有的鑰匙:", list(st.secrets.keys()))
+    # ---------------------------
     st.header("⚡ 全能達人戰情室 (V32.0)")
     col_input, col_info = st.columns([1, 3])
     with col_input: 
@@ -1133,13 +1138,17 @@ def page_dashboard():
                 
                 st.divider()
 
-                # ================= [V32.0] Gemini 分析師按鈕 =================
-                if "gemini_api_key" in st.secrets:
+# ================= [V32.4] Gemini 分析師 (穩定額度版) =================
+                if "AI_Studio_Key" in st.secrets:
                     if st.button("🤖 呼叫 Gemini 頂級分析師", type="primary"):
                         with st.spinner("Gemini 正在閱讀財報與新聞..."):
                             try:
-                                genai.configure(api_key=st.secrets["gemini_api_key"])
-                                model = genai.GenerativeModel('gemini-1.5-flash')
+                                # 設定 Key
+                                genai.configure(api_key=st.secrets["AI_Studio_Key"])
+                                
+                                # [修正點] 改用 'gemini-flash-latest'
+                                # 這會自動指向目前有免費額度的最新版本 (通常是 1.5 Flash)
+                                model = genai.GenerativeModel('gemini-flash-latest')
                                 
                                 # 準備資料
                                 last_close = df.iloc[-1]['Close']
@@ -1159,9 +1168,13 @@ def page_dashboard():
                                 st.markdown(f"> {response.text}")
                                 
                             except Exception as e:
-                                st.error(f"Gemini 連線失敗: {e}")
+                                # 錯誤處理優化：如果還是 429，顯示更友善的訊息
+                                if "429" in str(e):
+                                    st.warning("⚠️ AI 分析師正在忙線中 (達到免費額度上限)，請稍等 1 分鐘後再試。")
+                                else:
+                                    st.error(f"Gemini 連線失敗: {e}")
                 else:
-                    st.caption("⚠️ 請在 Secrets 設定 gemini_api_key 以啟用 AI 分析")
+                    st.caption("⚠️ 請在 Secrets 設定 AI_Studio_Key 以啟用 AI 分析")
                 st.divider()
                 # ===========================================================
 
