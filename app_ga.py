@@ -1,3 +1,11 @@
+import logging
+
+# [V31.2] 系統警示消音器
+# 忽略 Streamlit 多執行緒的 Context 警告 (因為我們只做純運算，這是安全的)
+logging.getLogger('streamlit.runtime.scriptrunner_utils.script_run_context').setLevel(logging.ERROR)
+logging.getLogger('streamlit.runtime.scriptrunner.script_run_context').setLevel(logging.ERROR)
+
+# ... (接著原本的 import streamlit as st 等等) ...
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -13,6 +21,9 @@ import email.utils
 from concurrent.futures import ThreadPoolExecutor
 from scipy.signal import argrelextrema 
 import json
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 # 忽略警告
 warnings.filterwarnings("ignore")
@@ -415,6 +426,38 @@ def generate_app_report(ticker, df, res):
     }
     return report_data
 
+# ==========================================
+# [V29.3] Email SMTP 模組 (永久免費穩定版)
+# ==========================================
+def send_email_report(subject, html_content):
+    # 1. 檢查 Secrets
+    if 'email_sender' not in st.secrets or 'email_password' not in st.secrets:
+        return False, "❌ 未設定 Email 帳號或應用程式密碼"
+
+    sender = st.secrets['email_sender']
+    password = st.secrets['email_password']
+    receiver = st.secrets.get('email_receiver', sender) # 若沒設接收者，預設寄給自己
+    
+    # 2. 建構郵件
+    msg = MIMEMultipart()
+    msg['From'] = f"AI 戰情室 <{sender}>"
+    msg['To'] = receiver
+    msg['Subject'] = subject
+    
+    # 支援 HTML 格式
+    msg.attach(MIMEText(html_content, 'html'))
+    
+    try:
+        # 3. 連接 Gmail SMTP Server (SSL Port 465)
+        server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
+        server.login(sender, password)
+        server.sendmail(sender, receiver, msg.as_string())
+        server.quit()
+        return True, f"✅ 戰報已寄至 {receiver}！"
+    except Exception as e:
+        return False, f"❌ 發送失敗: {str(e)}"
+    
+
 def process_stock_task(ticker):
     try:
         # [V27.10] 隨機延遲，防止 IP 被鎖
@@ -736,98 +779,222 @@ def fitness_func(ga_instance, sol, idx):
     # 回傳增加 sharpe_ratio 和 win_rate
     return pos_list, np.concatenate(([1.0], cum_ret)), total_ret, mdd, strat_names[strategy_mode], st_line, st_trends, entry_reasons, sharpe_ratio, win_rate
 
-# --- Page 1: AI 總司令選股 (V28.1 狀態保存 & 排版優化版) ---
+# --- Page 1: AI 總司令選股 (V30.0 天網全域掃描版) ---
 def page_ai_selector():
-    st.header("🤖 AI 總司令：全自動選股戰情室")
+    st.header("🤖 AI 總司令：全自動選股戰情室 (V30.0)")
     
-    # 初始化 Session State (用於保存掃描結果)
+    # 初始化 Session State
     if 'scan_results_df' not in st.session_state: st.session_state.scan_results_df = None
     if 'scan_top_stock' not in st.session_state: st.session_state.scan_top_stock = None
     if 'scan_json_report' not in st.session_state: st.session_state.scan_json_report = None
     
-    # 選擇板塊
-    selected_chain = st.selectbox("請選擇戰略板塊 (Sector):", list(SECTOR_DB.keys()))
-    sub_sectors = SECTOR_DB[selected_chain]
+    # [V30.0] 新增：掃描範圍選擇器
+    c_mode, c_info = st.columns([1, 2])
+    with c_mode:
+        scan_scope = st.radio("📡 掃描雷達範圍", ["🎯 單一戰略板塊", "🌍 全球戰略 (全域掃描)"], horizontal=True)
     
-    # [V28.1 優化] 顯示板塊成分股 (排序 + 緊湊排版)
     all_tickers = []
+    selected_sector_name = "全域市場"
     
-    # 建立一個容器來顯示標籤
-    with st.expander("📂 檢視板塊成分股清單", expanded=True):
-        for sub_name, tickers in sub_sectors.items():
-            st.markdown(f"**📌 {sub_name}**")
+    # --- 邏輯分支 ---
+    if scan_scope == "🎯 單一戰略板塊":
+        # 原本的單一板塊邏輯
+        selected_chain = st.selectbox("請選擇戰略板塊:", list(SECTOR_DB.keys()))
+        selected_sector_name = selected_chain
+        sub_sectors = SECTOR_DB[selected_chain]
+        
+        # 收集該板塊股票
+        with st.expander(f"📂 檢視 {selected_chain} 成分股", expanded=True):
+            for sub_name, tickers in sub_sectors.items():
+                st.markdown(f"**📌 {sub_name}**")
+                sorted_tickers = sorted(tickers)
+                all_tickers.extend(sorted_tickers)
+                # 顯示標籤
+                html_tags = ""
+                for t in sorted_tickers:
+                    display_name = STOCK_NAMES.get(t, t.replace(".TW", "").replace(".TWO", ""))
+                    clean_code = t.replace(".TW", "").replace(".TWO", "")
+                    html_tags += f'<span class="stock-tag">{clean_code} {display_name}</span>'
+                st.markdown(f'<div style="line-height: 1.8;">{html_tags}</div>', unsafe_allow_html=True)
+                st.write("")
+                
+    else:
+        # [V30.0] 全域掃描邏輯
+        st.info("🌍 您已啟動「天網模式」，將掃描資料庫中 **所有板塊** 的股票。")
+        
+        # 收集所有股票 (去除重複)
+        unique_tickers = set()
+        total_sectors = 0
+        for sector_name, sub_dict in SECTOR_DB.items():
+            total_sectors += 1
+            for t_list in sub_dict.values():
+                for t in t_list:
+                    unique_tickers.add(t)
+        
+        all_tickers = sorted(list(unique_tickers))
+        
+        with c_info:
+            st.metric("掃描目標總數", f"{len(all_tickers)} 檔", f"涵蓋 {total_sectors} 大板塊")
             
-            # 1. 排序股票代號
-            sorted_tickers = sorted(tickers)
-            all_tickers.extend(sorted_tickers)
-            
-            # 2. 生成緊湊 HTML 標籤
-            html_tags = ""
-            for t in sorted_tickers:
-                # 嘗試取得簡稱，若無則顯示代號
-                display_name = STOCK_NAMES.get(t, t.replace(".TW", "").replace(".TWO", ""))
-                clean_code = t.replace(".TW", "").replace(".TWO", "")
-                # 組合標籤
-                html_tags += f'<span class="stock-tag">{clean_code} {display_name}</span>'
-            
-            # 3. 渲染 HTML
-            st.markdown(f'<div style="line-height: 1.8;">{html_tags}</div>', unsafe_allow_html=True)
-            st.write("") # 空行分隔子板塊
-            
+        with st.expander("📂 檢視全域掃描清單 (已去重)", expanded=False):
+            st.write(", ".join([t.replace(".TW","") for t in all_tickers]))
+
     st.markdown("---")
     
     # 啟動掃描按鈕
-    if st.button("🚀 啟動 AI 總司令掃描 (多執行緒加速)", type="primary"):
-        results = []
-        progress_bar = st.progress(0); status_text = st.empty(); 
-        status_text.text("⚡ AI 部隊集結中，正在平行掃描全市場...")
-        
-        start_time = time.time()
-        
-        # 使用執行緒池進行並行掃描
-        with ThreadPoolExecutor(max_workers=10) as executor:
-            futures = list(executor.map(process_stock_task, all_tickers))
-            
-        for i, res in enumerate(futures):
-            if res: results.append(res)
-            progress_bar.progress((i + 1) / len(all_tickers))
-            
-        end_time = time.time(); duration = end_time - start_time
-        
-        if results:
-            # 處理結果
-            res_df = pd.DataFrame(results).sort_values("總分", ascending=False)
-            top_stock = res_df.iloc[0]
-            
-            # 生成 JSON 報告
-            scan_results_list = res_df.to_dict('records')
-            json_report = generate_battle_report(top_stock, scan_results_list)
-            
-            # [關鍵] 將結果存入 Session State
-            st.session_state.scan_results_df = res_df
-            st.session_state.scan_top_stock = top_stock
-            st.session_state.scan_json_report = json_report
-            
-            status_text.success(f"✅ 掃描完成！耗時 {duration:.2f} 秒。")
+    btn_label = f"🚀 啟動{scan_scope}"
+    if st.button(btn_label, type="primary"):
+        if not all_tickers:
+            st.error("❌ 掃描清單為空，請檢查 sector_db.json")
         else:
-            st.warning("無有效資料或連線失敗。")
+            results = []
+            progress_bar = st.progress(0); status_text = st.empty(); 
+            status_text.text(f"⚡ AI 部隊集結中，目標 {len(all_tickers)} 檔，正在平行掃描...")
             
-    # --- [V28.1 新增] 檢查並顯示 Session State 中的結果 ---
+            start_time = time.time()
+            
+            # 使用執行緒池 (雲端建議 max_workers 不要超過 5，避免記憶體爆掉)
+            # 如果是在本機跑，可以改回 10 或 20
+            workers = 5 
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = list(executor.map(process_stock_task, all_tickers))
+                
+            for i, res in enumerate(futures):
+                if res: results.append(res)
+                progress_bar.progress((i + 1) / len(all_tickers))
+                
+            end_time = time.time(); duration = end_time - start_time
+            
+            if results:
+                # 處理結果
+                res_df = pd.DataFrame(results).sort_values("總分", ascending=False)
+                top_stock = res_df.iloc[0] # 找出全體總冠軍
+                
+                # 生成 JSON 報告
+                scan_results_list = res_df.to_dict('records')
+                json_report = generate_battle_report(top_stock, scan_results_list)
+                
+                # 存入 Session State
+                st.session_state.scan_results_df = res_df
+                st.session_state.scan_top_stock = top_stock
+                st.session_state.scan_json_report = json_report
+                
+                status_text.success(f"✅ 全域掃描完成！耗時 {duration:.2f} 秒。")
+            else:
+                st.warning("無有效資料或連線失敗。")
+            
+    # --- 顯示結果與 Email 發送 (共用邏輯) ---
     if st.session_state.scan_results_df is not None:
-        # 從 Session State 讀取數據
+        
         res_df = st.session_state.scan_results_df
         top_stock = st.session_state.scan_top_stock
         json_report = st.session_state.scan_json_report
         
-        st.success(f"🏆 目前冠軍 (已快取)：**{top_stock['名稱']} ({top_stock['代號']})** 總分：{top_stock['總分']}")
+        # 標題區分
+        if scan_scope == "🎯 單一戰略板塊":
+            st.success(f"🏆 【{selected_sector_name}】板塊冠軍：**{top_stock['名稱']}** 總分：{top_stock['總分']}")
+        else:
+            st.success(f"👑 **【全市場總冠軍】**：**{top_stock['名稱']} ({top_stock['代號']})** 總分：{top_stock['總分']}")
         
-        # 顯示結果表格 (含漸層色)
-        st.dataframe(res_df.style.background_gradient(subset=['總分'], cmap='RdYlGn'), use_container_width=True)
+        # 顯示前 20 名 (避免全域掃描列表太長)
+        st.dataframe(res_df.head(50).style.background_gradient(subset=['總分'], cmap='RdYlGn'), use_container_width=True)
+        st.caption(f"💡 僅顯示前 50 名 (共 {len(res_df)} 筆結果)")
         
         target_code = top_stock['代號'].replace(".TW", "").replace(".TWO", "")
-        st.info(f"建議將 **{target_code}** 帶入 PyGAD 進行演化。")
+        st.info(f"建議將總冠軍 **{target_code}** 帶入 PyGAD 進行演化。")
         
-        # 顯示 JSON 報告
+# ... (接續在 target_code = ... 之後) ...
+        
+        # ================= [V31.1 修正版] Email 發送區塊 =================
+        # 修正重點：先計算變數，再建立介面 (Columns)，防止 NameError
+        
+        st.markdown("---")
+        
+        # --- 1. 先準備好資料 (Top 10 與 HTML) ---
+        # 標題設定
+        if scan_scope == "🎯 單一戰略板塊":
+            title_prefix = f"【{selected_sector_name}冠軍】"
+        else:
+            title_prefix = "【全域總冠軍】" if len(res_df) > 50 else "【掃描冠軍】"
+            
+        email_subject = f"AI戰報(V31)：{title_prefix} {top_stock['名稱']}({target_code}) 分析報告"
+        
+        # 生成 Top 10 HTML
+        top_10_html = ""
+        limit = min(10, len(res_df))
+        
+        for i in range(limit):
+            row = res_df.iloc[i]
+            # 處理可能沒有 '現價' 欄位的防呆 (雖然通常會有)
+            price_val = row.get('現價', 0)
+            price_fmt = f"{price_val:.1f}"
+            score_fmt = f"{row['總分']}"
+            
+            icon = "🔹"
+            if i == 0: icon = "🥇"
+            elif i == 1: icon = "🥈"
+            elif i == 2: icon = "🥉"
+            
+            top_10_html += f"<li>{icon} <b>{row['名稱']}</b> ({row['代號']}) - 總分: {score_fmt} | 現價: {price_fmt}</li>"
+
+        # 組合最終 HTML
+        email_html = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif;">
+            <h2 style="color: #00adb5;">🤖 AI 戰情室 V31 每日晨報</h2>
+            <hr>
+            <p>早安！AI 系統已完成掃描，今日決選結果如下：</p>
+            <table style="width: 100%; border-collapse: collapse;">
+                <tr style="background-color: #f2f2f2;">
+                    <td style="padding: 10px; border: 1px solid #ddd;"><b>👑 總冠軍</b></td>
+                    <td style="padding: 10px; border: 1px solid #ddd; color: red;"><b>{top_stock['名稱']} ({target_code})</b></td>
+                </tr>
+                <tr>
+                    <td style="padding: 10px; border: 1px solid #ddd;"><b>🔥 戰力總分</b></td>
+                    <td style="padding: 10px; border: 1px solid #ddd;"><b>{top_stock['總分']} 分</b></td>
+                </tr>
+                <tr style="background-color: #f2f2f2;">
+                    <td style="padding: 10px; border: 1px solid #ddd;"><b>💰 收盤價</b></td>
+                    <td style="padding: 10px; border: 1px solid #ddd;">{top_stock['現價']:.1f} ({top_stock['斜率']})</td>
+                </tr>
+            </table>
+            <br>
+            <p><b>📊 今日強勢股 Top 10：</b></p>
+            <ul style="line-height: 1.6;">
+                {top_10_html}
+            </ul>
+            <br>
+            <p><b>💡 戰略建議：</b></p>
+            <ul>
+                <li>請關注總冠軍 <b>{target_code}</b> 之開盤表現。</li>
+                <li>若 Top 10 中集中於特定板塊，代表該族群今日資金動能強勁。</li>
+            </ul>
+            <br>
+            <p style="color: gray; font-size: 0.8em;">本信件由 AI 戰情室 V31 自動發送。</p>
+        </body>
+        </html>
+        """
+
+        # --- 2. 再繪製介面 (Columns) ---
+        c_mail_1, c_mail_2 = st.columns([3, 1])
+        
+        with c_mail_1:
+            st.info(f"📧 已準備好 HTML 戰報：**{email_subject}**")
+            # 這裡可以選填顯示預覽，或為了版面簡潔省略
+            
+        with c_mail_2:
+            st.write(" ") 
+            st.write(" ")
+            # 這裡引用上面的 email_subject 就絕對安全了
+            if st.button("📧 發送 Email 戰報", type="primary"):
+                success, status_msg = send_email_report(email_subject, email_html)
+                if success:
+                    st.toast(status_msg, icon="✅")
+                    st.success(status_msg)
+                else:
+                    st.error(status_msg)
+        # ============================================================
+        
         st.markdown("---")
         with st.expander("📋 每日戰情通報 (JSON For App)", expanded=True):
             st.markdown(f'<div class="json-box">{json_report}</div>', unsafe_allow_html=True)
@@ -977,7 +1144,7 @@ def page_ga():
     with st.expander("⚙️ 進化參數"): 
         gens = st.slider("繁衍代數", 5, 100, 30)
         pop_size = st.slider("種群大小", 10, 50, 20)
-        
+
     if st.button("🧬 啟動 AI 全方位進化 (一鍵三模)"):
         if 'ga_results' in st.session_state: del st.session_state.ga_results
         modes = ["🛡️ 保守型", "⚔️ 激進型", "🎯 狙擊型"]; results_store = {}
@@ -1191,5 +1358,5 @@ def page_ga():
 # 4. 主程式入口
 # ==========================================
 PAGES = {"🤖 AI 總司令選股": page_ai_selector, "⚡ 全能達人戰情室": page_dashboard, "🧬 PyGAD 策略進化": page_ga}
-st.sidebar.title("⚡ AI 戰情室 V28.0"); st.sidebar.caption("相容修復 | JSON完美")
+st.sidebar.title("⚡ AI 戰情室 V31.2"); st.sidebar.caption("相容修復 | JSON完美")
 sel = st.sidebar.radio("功能模組", list(PAGES.keys())); PAGES[sel]()
