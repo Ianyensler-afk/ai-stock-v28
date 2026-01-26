@@ -833,8 +833,20 @@ def page_ai_selector():
         
         all_tickers = sorted(list(unique_tickers))
         
+        # -------------------------------------------------------
+        # [修正點] 這裡原本少了 # 號導致報錯，現在修復了
+        # 統計各個板塊的數量 (用於核對資料一致性)
+        sector_counts = {k: sum(len(v) for v in sub.values()) for k, sub in SECTOR_DB.items()}
+        # -------------------------------------------------------
+        
         with c_info:
+            # [V31.3] 增加詳細核對資訊
             st.metric("掃描目標總數", f"{len(all_tickers)} 檔", f"涵蓋 {total_sectors} 大板塊")
+            
+            # 顯示前幾個板塊的數量，方便您核對 (只顯示前 3 個板塊當代表)
+            # 這裡會把剛剛算出來的 sector_counts 轉成字串顯示
+            check_str = " | ".join([f"{k}:{v}" for k,v in list(sector_counts.items())[:3]])
+            st.caption(f"🛡️ 資料一致性核對: {check_str} ...")
             
         with st.expander("📂 檢視全域掃描清單 (已去重)", expanded=False):
             st.write(", ".join([t.replace(".TW","") for t in all_tickers]))
