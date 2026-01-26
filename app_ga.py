@@ -174,44 +174,62 @@ SECTOR_DB = load_external_data()
 # 1. 核心工具 (ETL)
 # ==========================================
 
+# [V31.5] 強化的數據獲取函數 (抗阻擋版)
+import random
+
 @st.cache_data(ttl=600)
 def get_stock_data(ticker, period="2y"):
-    df = pd.DataFrame()
+    # 偽裝成瀏覽器的 Header
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    }
+
+    # 處理代號格式
     tickers_to_try = [ticker]
     if ticker.isdigit(): tickers_to_try = [f"{ticker}.TW", f"{ticker}.TWO"]
     elif not ticker.endswith(".TW") and not ticker.endswith(".TWO") and not ticker.isalpha(): 
         tickers_to_try = [f"{ticker}.TW"]
-        
-    for t in tickers_to_try:
-        try:
-            stock = yf.Ticker(t)
-            temp = stock.history(period=period)
-            if not temp.empty and len(temp) > 30: 
-                df = temp
-                break
-        except: continue
     
-    if df.empty: return pd.DataFrame()
-
-    try:
-        if df.index.tz is not None: df.index = df.index.tz_localize(None)
-        df = df[~df.index.duplicated(keep='first')] 
-        
-        target_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-        clean_df = pd.DataFrame(index=df.index)
-        col_map = {str(c).lower(): c for c in df.columns}
-        
-        for target in target_cols:
-            target_lower = target.lower()
-            if target_lower in col_map:
-                clean_df[target] = df[col_map[target_lower]]
-            else:
-                clean_df[target] = 0.0
-        
-        clean_df = clean_df.ffill().bfill().fillna(0)
-        return clean_df.astype(float)
-    except Exception as e:
-        return pd.DataFrame()
+    # 開始嘗試
+    for t in tickers_to_try:
+        # [V31.5 新增] 重試迴圈 (Max 3次)
+        for attempt in range(3):
+            try:
+                # 建立 Ticker 物件 (yfinance 內部會處理 session，但我們可以透過延遲來優化)
+                stock = yf.Ticker(t)
+                
+                # 下載數據
+                temp = stock.history(period=period)
+                
+                # 判定是否成功
+                if not temp.empty and len(temp) > 30: 
+                    df = temp
+                    
+                    # --- 資料清洗標準程序 ---
+                    if df.index.tz is not None: df.index = df.index.tz_localize(None)
+                    df = df[~df.index.duplicated(keep='first')] 
+                    target_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+                    clean_df = pd.DataFrame(index=df.index)
+                    col_map = {str(c).lower(): c for c in df.columns}
+                    for target in target_cols:
+                        target_lower = target.lower()
+                        if target_lower in col_map: clean_df[target] = df[col_map[target_lower]]
+                        else: clean_df[target] = 0.0
+                    
+                    clean_df = clean_df.ffill().bfill().fillna(0)
+                    return clean_df.astype(float)
+                
+                else:
+                    # 抓不到資料，休息一下再試 (Random Sleep 0.5 ~ 2.0s)
+                    time.sleep(random.uniform(0.5, 2.0))
+                    
+            except Exception as e:
+                # 發生錯誤，休息久一點再試
+                time.sleep(random.uniform(1.0, 3.0))
+                continue
+                
+    # 試了所有方法都失敗，回傳空
+    return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
 def get_stock_info(ticker):
@@ -867,7 +885,10 @@ def page_ai_selector():
             
             # 使用執行緒池 (雲端建議 max_workers 不要超過 5，避免記憶體爆掉)
             # 如果是在本機跑，可以改回 10 或 20
-            workers = 5 
+            # 使用執行緒池
+            # [V31.5 建議] 雲端為了抗阻擋，降速求穩
+            # 本機可以用 10，雲端建議改為 3 或 4
+            workers = 4 
             with ThreadPoolExecutor(max_workers=workers) as executor:
                 futures = list(executor.map(process_stock_task, all_tickers))
                 
