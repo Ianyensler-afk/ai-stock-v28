@@ -4,7 +4,7 @@ import logging
 # 忽略 Streamlit 多執行緒的 Context 警告 (因為我們只做純運算，這是安全的)
 logging.getLogger('streamlit.runtime.scriptrunner_utils.script_run_context').setLevel(logging.ERROR)
 logging.getLogger('streamlit.runtime.scriptrunner.script_run_context').setLevel(logging.ERROR)
-
+import google.generativeai as genai
 # ... (接著原本的 import streamlit as st 等等) ...
 import streamlit as st
 import yfinance as yf
@@ -940,8 +940,10 @@ def page_ai_selector():
                 st.warning("無有效資料或連線失敗。")
             
     # --- 顯示結果與 Email 發送 (共用邏輯) ---
+    # [修正重點] 下面這一行是第 943 行左右，注意看冒號 :
     if st.session_state.scan_results_df is not None:
         
+        # [修正重點] 這裡必須縮排 (4個空白)，Python 才知道這些程式碼屬於上面的 if
         res_df = st.session_state.scan_results_df
         top_stock = st.session_state.scan_top_stock
         json_report = st.session_state.scan_json_report
@@ -952,54 +954,87 @@ def page_ai_selector():
         else:
             st.success(f"👑 **【全市場總冠軍】**：**{top_stock['名稱']} ({top_stock['代號']})** 總分：{top_stock['總分']}")
         
-        # 顯示前 20 名 (避免全域掃描列表太長)
+        # 顯示結果表格 (這一行原本報錯，現在縮排正確了)
         st.dataframe(res_df.head(50).style.background_gradient(subset=['總分'], cmap='RdYlGn'), use_container_width=True)
         st.caption(f"💡 僅顯示前 50 名 (共 {len(res_df)} 筆結果)")
-        
+
+        # ================= [V32.0 新增] 全市場熱力圖 (Market Treemap) =================
+        st.markdown("---")
+        with st.expander("🗺️ V32.0 戰略地圖：全市場資金流向熱力圖", expanded=True):
+            if '板塊' not in res_df.columns:
+                # 1. 建立反向索引 (Ticker -> Sector)
+                ticker_to_sector = {}
+                for main_sec, sub_dict in SECTOR_DB.items():
+                    for sub_sec, t_list in sub_dict.items():
+                        for t in t_list:
+                            clean_t = t.replace(".TW", "").replace(".TWO", "")
+                            # 格式: 主板塊 > 子板塊
+                            ticker_to_sector[clean_t] = {"Main": main_sec, "Sub": sub_sec}
+                
+                # 2. 將板塊資訊 Map 回 res_df
+                # 使用 apply 搭配 lambda 來查表
+                def get_sector_info(row, key):
+                    code = row['代號'].replace(".TW", "").replace(".TWO", "")
+                    return ticker_to_sector.get(code, {}).get(key, "其他")
+
+                # 為了不影響原始 df，建立一個繪圖專用 df
+                plot_df = res_df.copy()
+                plot_df['主板塊'] = plot_df.apply(lambda x: get_sector_info(x, "Main"), axis=1)
+                plot_df['子板塊'] = plot_df.apply(lambda x: get_sector_info(x, "Sub"), axis=1)
+                # 權重放大
+                plot_df['權重'] = plot_df['總分'] ** 2 
+                
+                # 3. 繪製 Treemap
+                import plotly.express as px
+                
+                # 定義顏色：分數越高越紅
+                fig_tree = px.treemap(
+                    plot_df, 
+                    path=[px.Constant("台股全市場"), '主板塊', '子板塊', '名稱'], 
+                    values='權重',
+                    color='總分',
+                    color_continuous_scale='RdYlGn_r', # 紅到綠
+                    title=f"AI 戰力熱力圖 (總掃描: {len(plot_df)} 檔)"
+                )
+                fig_tree.update_traces(root_color="lightgrey")
+                fig_tree.update_layout(margin=dict(t=30, l=10, r=10, b=10), height=500)
+                
+                st.plotly_chart(fig_tree, use_container_width=True)
+        # =========================================================================
+
         target_code = top_stock['代號'].replace(".TW", "").replace(".TWO", "")
         st.info(f"建議將總冠軍 **{target_code}** 帶入 PyGAD 進行演化。")
         
-# ... (接續在 target_code = ... 之後) ...
-        
-        # ================= [V31.1 修正版] Email 發送區塊 =================
-        # 修正重點：先計算變數，再建立介面 (Columns)，防止 NameError
-        
+        # ================= [V31.1] Email 發送區塊 =================
         st.markdown("---")
         
-        # --- 1. 先準備好資料 (Top 10 與 HTML) ---
-        # 標題設定
+        # 準備 Email 標題
         if scan_scope == "🎯 單一戰略板塊":
             title_prefix = f"【{selected_sector_name}冠軍】"
         else:
             title_prefix = "【全域總冠軍】" if len(res_df) > 50 else "【掃描冠軍】"
             
-        email_subject = f"AI戰報(V31)：{title_prefix} {top_stock['名稱']}({target_code}) 分析報告"
+        email_subject = f"AI戰報(V32)：{title_prefix} {top_stock['名稱']}({target_code}) 分析報告"
         
         # 生成 Top 10 HTML
         top_10_html = ""
         limit = min(10, len(res_df))
-        
         for i in range(limit):
             row = res_df.iloc[i]
-            # 處理可能沒有 '現價' 欄位的防呆 (雖然通常會有)
             price_val = row.get('現價', 0)
-            price_fmt = f"{price_val:.1f}"
-            score_fmt = f"{row['總分']}"
-            
             icon = "🔹"
             if i == 0: icon = "🥇"
             elif i == 1: icon = "🥈"
             elif i == 2: icon = "🥉"
-            
-            top_10_html += f"<li>{icon} <b>{row['名稱']}</b> ({row['代號']}) - 總分: {score_fmt} | 現價: {price_fmt}</li>"
+            top_10_html += f"<li>{icon} <b>{row['名稱']}</b> ({row['代號']}) - 總分: {row['總分']} | 現價: {price_val:.1f}</li>"
 
-        # 組合最終 HTML
+        # 組合 HTML
         email_html = f"""
         <html>
         <body style="font-family: Arial, sans-serif;">
-            <h2 style="color: #00adb5;">🤖 AI 戰情室 V31 每日晨報</h2>
+            <h2 style="color: #00adb5;">🤖 AI 戰情室 V32 每日晨報</h2>
             <hr>
-            <p>早安！AI 系統已完成掃描，今日決選結果如下：</p>
+            <p>早安！AI 系統已完成 V32 天眼掃描，今日決選結果如下：</p>
             <table style="width: 100%; border-collapse: collapse;">
                 <tr style="background-color: #f2f2f2;">
                     <td style="padding: 10px; border: 1px solid #ddd;"><b>👑 總冠軍</b></td>
@@ -1009,39 +1044,22 @@ def page_ai_selector():
                     <td style="padding: 10px; border: 1px solid #ddd;"><b>🔥 戰力總分</b></td>
                     <td style="padding: 10px; border: 1px solid #ddd;"><b>{top_stock['總分']} 分</b></td>
                 </tr>
-                <tr style="background-color: #f2f2f2;">
-                    <td style="padding: 10px; border: 1px solid #ddd;"><b>💰 收盤價</b></td>
-                    <td style="padding: 10px; border: 1px solid #ddd;">{top_stock['現價']:.1f} ({top_stock['斜率']})</td>
-                </tr>
             </table>
             <br>
             <p><b>📊 今日強勢股 Top 10：</b></p>
-            <ul style="line-height: 1.6;">
-                {top_10_html}
-            </ul>
+            <ul style="line-height: 1.6;">{top_10_html}</ul>
             <br>
-            <p><b>💡 戰略建議：</b></p>
-            <ul>
-                <li>請關注總冠軍 <b>{target_code}</b> 之開盤表現。</li>
-                <li>若 Top 10 中集中於特定板塊，代表該族群今日資金動能強勁。</li>
-            </ul>
-            <br>
-            <p style="color: gray; font-size: 0.8em;">本信件由 AI 戰情室 V31 自動發送。</p>
+            <p style="color: gray; font-size: 0.8em;">本信件由 AI 戰情室 V32 自動發送。</p>
         </body>
         </html>
         """
 
-        # --- 2. 再繪製介面 (Columns) ---
         c_mail_1, c_mail_2 = st.columns([3, 1])
-        
         with c_mail_1:
             st.info(f"📧 已準備好 HTML 戰報：**{email_subject}**")
-            # 這裡可以選填顯示預覽，或為了版面簡潔省略
-            
         with c_mail_2:
             st.write(" ") 
             st.write(" ")
-            # 這裡引用上面的 email_subject 就絕對安全了
             if st.button("📧 發送 Email 戰報", type="primary"):
                 success, status_msg = send_email_report(email_subject, email_html)
                 if success:
@@ -1063,19 +1081,25 @@ def page_ai_selector():
         with c3: st.markdown("#### 🚀 M - 動能"); st.write("月漲>0%(+5), 月漲>5%(+5)")
         with c4: st.markdown("#### 🏢 F - 基本"); st.write("基礎分(+5), PE<25(+2), PB<4(+2)")
 
-# --- Page 2: 全能達人戰情室 ---
+# --- Page 2: 全能達人戰情室 (V32.0 Gemini 整合版) ---
 def page_dashboard():
-    st.header("⚡ 全能達人戰情室 (V27.10)")
+    st.header("⚡ 全能達人戰情室 (V32.0)")
     col_input, col_info = st.columns([1, 3])
-    with col_input: t = st.text_input("輸入個股代號", "2330", key="dash_t")
+    with col_input: 
+        t = st.text_input("輸入個股代號", "2330", key="dash_t")
     
     if t:
+        # 1. 抓取資料
         df = get_stock_data(t)
-        if df.empty or len(df) < 30: st.error("無資料"); return
+        if df.empty or len(df) < 30: 
+            st.error("無資料或資料不足")
+            return
         
         df = calculate_indicators(df)
         info = get_stock_info(t)
+        # 嘗試取得名稱，若無則用代號
         name = STOCK_NAMES.get(t.upper() + ".TW", t)
+        if name == t: name = STOCK_NAMES.get(t, t)
         
         last = df.iloc[-1]; prev = df.iloc[-2]
         change = last['Close'] - prev['Close']; pct = change / prev['Close']
@@ -1087,48 +1111,97 @@ def page_dashboard():
             sectors = get_sector_info(t.upper() + ".TW") 
             for s in sectors: st.caption(f"📍 {s}")
             
-        tab1, tab2, tab3 = st.tabs(["ℹ️ 資訊流", "💸 資金流", "📈 技術流"])
+        tab1, tab2, tab3 = st.tabs(["ℹ️ 資訊流 & AI", "💸 資金流", "📈 技術流"])
         
+        # --- Tab 1: 資訊流 (含 V32.0 Gemini) ---
         with tab1:
             c1, c2 = st.columns([1, 1])
             with c1:
-                st.subheader("📰 特種搜查 (V28 AI加強版)")
-                # [V28] 改用新函式
-                news, keywords = get_special_news_v28(t, name) 
+                st.subheader("📰 特種搜查")
+                # 呼叫新聞函數 (相容舊版名稱，若您有改名請自行調整)
+                try:
+                    news, keywords = get_special_news_v28(t, name)
+                except:
+                    # 相容性備案
+                    news = get_special_news(t, name); keywords = []
                 
-                # 顯示關鍵字雲
+                # 顯示關鍵字
                 if keywords:
                     st.markdown("🔥 **AI 提取關鍵字:**")
                     kw_html = "".join([f"<span style='background:#333;color:#00adb5;padding:2px 6px;border-radius:4px;margin:2px;font-size:0.8em'>{k}</span>" for k in keywords])
                     st.markdown(kw_html, unsafe_allow_html=True)
-                    st.divider()
+                
+                st.divider()
+
+                # ================= [V32.0] Gemini 分析師按鈕 =================
+                if "gemini_api_key" in st.secrets:
+                    if st.button("🤖 呼叫 Gemini 頂級分析師", type="primary"):
+                        with st.spinner("Gemini 正在閱讀財報與新聞..."):
+                            try:
+                                genai.configure(api_key=st.secrets["gemini_api_key"])
+                                model = genai.GenerativeModel('gemini-1.5-flash')
+                                
+                                # 準備資料
+                                last_close = df.iloc[-1]['Close']
+                                ma60 = df.iloc[-1]['MA60']
+                                trend = "多頭排列" if last_close > ma60 else "空頭/盤整"
+                                news_titles = ", ".join([n['title'] for n in news[:5]]) if news else "無近期新聞"
+                                
+                                prompt = (
+                                    f"你是一位華爾街頂級分析師。請分析台股 {name}({t})。\n"
+                                    f"1. 技術面：現價 {last_close}，MA60為 {ma60:.2f}，目前呈現 {trend}。\n"
+                                    f"2. 消息面：近期新聞標題包含「{news_titles}」。\n"
+                                    f"3. 任務：請用繁體中文，綜合上述資訊，給出約 100 字的精簡點評，並指出潛在風險與機會。"
+                                )
+                                
+                                response = model.generate_content(prompt)
+                                st.success("🤖 Gemini 分析報告：")
+                                st.markdown(f"> {response.text}")
+                                
+                            except Exception as e:
+                                st.error(f"Gemini 連線失敗: {e}")
+                else:
+                    st.caption("⚠️ 請在 Secrets 設定 gemini_api_key 以啟用 AI 分析")
+                st.divider()
+                # ===========================================================
 
                 if news: 
-                    for n in news: st.markdown(f'<div class="news-card"><a href="{n["link"]}" target="_blank" class="news-title"><span class="sentiment-tag {n.get("sent_color", "sent-neu")}">{n.get("sent_label", "中性")}</span> {n["title"]}</a><span class="news-source">{n["publisher"]}</span> <span class="news-time">{n["pubDate"]}</span></div>', unsafe_allow_html=True)
-                else: st.info("無新聞")
-        with c2:
+                    for n in news: 
+                        st.markdown(f'<div class="news-card"><a href="{n["link"]}" target="_blank" class="news-title"><span class="sentiment-tag {n.get("sent_color", "sent-neu")}">{n.get("sent_label", "中性")}</span> {n["title"]}</a><span class="news-source">{n["publisher"]}</span> <span class="news-time">{n["pubDate"]}</span></div>', unsafe_allow_html=True)
+                else: 
+                    st.info("無新聞")
+                    st.markdown(f'<a href="https://www.google.com/search?q={t}+tw+stock+news&tbm=nws" target="_blank" class="link-btn">🔍 Google</a>', unsafe_allow_html=True)
+            
+            with c2: 
+                # 板塊雷達 (V28 功能)
                 st.subheader("🔗 板塊聯動雷達")
-                sec_data = analyze_sector_linkage(t)
-                if sec_data:
-                    st.caption(f"所屬子板塊: **{sec_data['sector']}**")
-                    
-                    # 顯示相關係數
-                    corr_cols = st.columns(len(sec_data['correlations']))
-                    for i, (p_name, corr_val) in enumerate(sec_data['correlations'].items()):
-                        color = "red" if corr_val > 0.8 else "orange" if corr_val > 0.5 else "gray"
-                        st.metric(f"vs {p_name}", f"{corr_val:.2f}", delta_color="off")
-                    
-                    # 畫圖: 個股 vs 板塊平均
-                    norm_df = sec_data['normalized']
-                    fig_sec = go.Figure()
-                    fig_sec.add_trace(go.Scatter(x=norm_df.index, y=norm_df['Main'], name=name, line=dict(color='yellow', width=2)))
-                    fig_sec.add_trace(go.Scatter(x=norm_df.index, y=sec_data['avg_trend'], name="同業平均", line=dict(color='gray', dash='dash')))
-                    fig_sec.update_layout(height=300, margin=dict(l=0,r=0,t=10,b=0), template="plotly_dark")
-                    st.plotly_chart(fig_sec, use_container_width=True)
-                else:
-                    st.warning("無法取得同業資料或無分類")
+                try:
+                    sec_data = analyze_sector_linkage(t)
+                    if sec_data:
+                        st.caption(f"所屬子板塊: **{sec_data['sector']}**")
+                        if sec_data['correlations']:
+                            corr_cols = st.columns(len(sec_data['correlations']))
+                            for i, (p_name, corr_val) in enumerate(sec_data['correlations'].items()):
+                                with corr_cols[i % 4]:
+                                    st.metric(f"vs {p_name}", f"{corr_val:.2f}")
+                        
+                        norm_df = sec_data['normalized']
+                        fig_sec = go.Figure()
+                        fig_sec.add_trace(go.Scatter(x=norm_df.index, y=norm_df['Main'], name=name, line=dict(color='yellow', width=2)))
+                        fig_sec.add_trace(go.Scatter(x=norm_df.index, y=sec_data['avg_trend'], name="同業平均", line=dict(color='gray', dash='dash')))
+                        fig_sec.update_layout(height=300, margin=dict(l=0,r=0,t=10,b=0), template="plotly_dark", hovermode="x unified")
+                        st.plotly_chart(fig_sec, use_container_width=True)
+                    else:
+                        st.warning("無法取得同業資料")
+                except:
+                    st.warning("板塊資料載入失敗")
 
+                st.subheader("🏢 簡介")
+                s = info.get('longBusinessSummary')
+                st.write(s) if s else st.warning("無簡介")
+                st.markdown(f'<a href="https://goodinfo.tw/tw/StockDetail.asp?STOCK_ID={t}" target="_blank" class="link-btn">Goodinfo</a>', unsafe_allow_html=True)
                 
+        # --- Tab 2: 資金流 ---
         with tab2:
             st.markdown("### 🏛️ 官方籌碼"); c_l = st.columns(3)
             with c_l[0]: st.markdown(f'<a href="https://goodinfo.tw/tw/ShowBuySaleChart.asp?STOCK_ID={t}&CHT_CAT=DATE" target="_blank" class="link-btn">Goodinfo</a>', unsafe_allow_html=True)
@@ -1149,6 +1222,7 @@ def page_dashboard():
             fig.update_layout(height=600, template="plotly_dark", xaxis_rangeslider_visible=False)
             st.plotly_chart(fig, use_container_width=True, key="fund")
             
+        # --- Tab 3: 技術流 ---
         with tab3:
             st.write("📊 **進階技術 (含圖形識別)**")
             c1,c2,c3 = st.columns(3)
@@ -1170,7 +1244,6 @@ def page_dashboard():
             fig.add_trace(go.Scatter(x=df.index, y=df['ADX'], line=dict(color='white')), row=3, col=1)
             fig.update_layout(height=700, template="plotly_dark", xaxis_rangeslider_visible=False)
             st.plotly_chart(fig, use_container_width=True, key="tech")
-
 def page_ga():
     st.header("🧬 PyGAD 策略進化 (V28.2 儀表板修復版)")
     if not HAS_PYGAD: st.error("❌ 需安裝 pygad"); return
@@ -1414,5 +1487,5 @@ def page_ga():
 # 4. 主程式入口
 # ==========================================
 PAGES = {"🤖 AI 總司令選股": page_ai_selector, "⚡ 全能達人戰情室": page_dashboard, "🧬 PyGAD 策略進化": page_ga}
-st.sidebar.title("⚡ AI 戰情室 V31.2"); st.sidebar.caption("相容修復 | JSON完美")
+st.sidebar.title("⚡ AI 戰情室 V32.0"); st.sidebar.caption("相容修復 | JSON完美")
 sel = st.sidebar.radio("功能模組", list(PAGES.keys())); PAGES[sel]()
