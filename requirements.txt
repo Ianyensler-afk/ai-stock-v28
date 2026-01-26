@@ -7,4 +7,6 @@ pygad
 scipy
 jieba
 snownlp
+
 requests
+google-generativeai
