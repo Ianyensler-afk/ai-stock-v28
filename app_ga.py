@@ -882,6 +882,29 @@ def page_ai_selector():
                 res_df = pd.DataFrame(results).sort_values("總分", ascending=False)
                 top_stock = res_df.iloc[0] # 找出全體總冠軍
                 
+                # [V31.4 新增] 資料品質健檢儀表板
+                # 1. 計算成功率：實際抓到的數量 / 預計掃描的數量
+                success_rate = len(res_df) / len(all_tickers)
+                
+                # 2. 檢查資料新鮮度：抓取冠軍股的最後一筆交易日期
+                # 我們需要重新叫一次 get_stock_data 來確認日期，或者在 process_stock_task 回傳時就包含日期
+                # 這裡用一個快速的方式：檢查 res_df 是否有包含日期欄位 (若之前沒存，這裡無法顯示，但可作為改善方向)
+                # 替代方案：我們直接在畫面上顯示「本次掃描樣本數」
+                
+                with c_info:
+                    # 覆蓋原本的 metric，顯示更詳細的品質數據
+                    st.metric(
+                        "掃描品質報告", 
+                        f"{len(res_df)} / {len(all_tickers)} 檔",
+                        f"成功率: {success_rate:.1%}"
+                    )
+                    
+                    if success_rate < 0.95:
+                        st.warning(f"⚠️ 警告：有 {len(all_tickers) - len(res_df)} 檔股票抓取失敗 (可能是雲端 IP 被擋)，結果可能失準。")
+                    else:
+                        st.caption("✅ 資料完整度良好 (Loss < 5%)")
+
+
                 # 生成 JSON 報告
                 scan_results_list = res_df.to_dict('records')
                 json_report = generate_battle_report(top_stock, scan_results_list)
