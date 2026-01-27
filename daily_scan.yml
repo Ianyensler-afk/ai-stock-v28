@@ -2,7 +2,7 @@ name: Daily Stock Scan & Sheet Sync
 
 on:
   schedule:
-    # 每天 UTC 10:00 = 台灣 18:00
+    # 每天 UTC 10:00 = 台灣 21:00
     # 1-5 代表週一到週五
     - cron: '0 10 * * 1-5'
   workflow_dispatch: # 手動觸發
@@ -33,3 +33,4 @@ jobs:
         GOOGLE_SHEET_URL: ${{ secrets.GOOGLE_SHEET_URL }}
       run: |
         python autobot.py
+
