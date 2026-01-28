@@ -2,8 +2,7 @@ name: AI Daily Scan & Report
 
 on:
   schedule:
-    # UTC 10:00 = 台灣時間 18:00 (週一至週五)
-    - cron: '0 10 * * 1-5'
+    - cron: '15 10 * * 1-5' # 18:35 (避開尖峰，通常會準時觸發)
   workflow_dispatch: # 允許手動按按鈕執行測試
 
 jobs:
@@ -32,3 +31,4 @@ jobs:
         EMAIL_RECEIVER: ${{ secrets.EMAIL_SENDER }} # 預設寄給自己，也可另設 Secret
       run: |
         python daily_report.py
+
