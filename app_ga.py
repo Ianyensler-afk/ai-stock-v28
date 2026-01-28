@@ -22,6 +22,44 @@ from email.mime.multipart import MIMEMultipart
 import sqlite3
 import random
 
+import streamlit as st
+import google.generativeai as genai
+import pandas as pd
+# ... 其他 import ...
+
+# ==========================================
+# 🚑 [緊急診斷] AI 環境檢測區
+# ==========================================
+with st.sidebar:
+    st.markdown("---")
+    st.subheader("🔧 AI 環境診斷")
+    
+    # 1. 檢查版本 (如果是 0.3.x 或 0.4.x 代表太舊，必須是 0.7.2 以上)
+    try:
+        ver = genai.__version__
+        st.write(f"📦 套件版本: `{ver}`")
+    except:
+        st.error("無法讀取版本，套件可能損壞")
+
+    # 2. 檢查 API Key 與可用模型
+    if "AI_Studio_Key" in st.secrets:
+        genai.configure(api_key=st.secrets["AI_Studio_Key"])
+        try:
+            st.write("🔍 正在掃描可用模型...")
+            # 列出所有支援 generateContent 的模型
+            models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+            if models:
+                st.success(f"✅ 抓到 {len(models)} 個模型")
+                st.code(models) # 顯示清單給您看
+            else:
+                st.error("❌ 掃描成功但清單為空 (您的 Key 可能權限不足)")
+        except Exception as e:
+            st.error(f"❌ 連線失敗: {e}")
+    else:
+        st.warning("⚠️ 尚未設定 API Key")
+    st.markdown("---")
+# ==========================================
+
 # [V31.2] 系統警示消音器
 logging.getLogger('streamlit.runtime.scriptrunner_utils.script_run_context').setLevel(logging.ERROR)
 logging.getLogger('streamlit.runtime.scriptrunner.script_run_context').setLevel(logging.ERROR)
@@ -218,42 +256,163 @@ def toggle_watchlist(ticker):
 
 # <--- 新代碼結束 --->
 
+# ==========================================
+# [V34.6] RAG 核心：智慧適配版 (針對您的先進環境)
+# ==========================================
 class RAGAdvisor:
     def __init__(self, api_key):
         genai.configure(api_key=api_key)
         self.embedding_model = "models/text-embedding-004"
         self.active_model = None
-        self.model_name = "未偵測"
+        self.model_name = "未連線"
         self.memory_docs = []
         self.memory_vecs = []
 
         try:
-            # [V33.7 修改] 優先順序調整：先 Flash (高額度) -> 再 Pro (高品質) -> 最後 Default
-            # 這樣可以避免一開始就撞牆 429 錯誤
-            priority_models = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
+            print("🔍 正在智慧匹配可用模型...")
             
-            available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+            # 1. 取得您帳號實際擁有的模型清單
+            all_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
             
-            target_model_name = None
-            for p_model in priority_models:
-                # 模糊比對，例如找到 'models/gemini-1.5-flash-001'
-                match = next((m for m in available_models if p_model in m), None)
+            # 2. 定義優先順序 (從您的清單中挑選最強最快的)
+            # 優先找 2.5 Flash -> 2.0 Flash -> 任何 Flash -> 任何 Pro
+            priority_keywords = [
+                "gemini-2.5-flash", 
+                "gemini-2.0-flash",
+                "gemini-flash",
+                "gemini-2.5-pro",
+                "gemini-2.0-pro"
+            ]
+            
+            target_model = None
+            
+            # 3. 進行匹配
+            for keyword in priority_keywords:
+                # 在您的清單中找是否有符合關鍵字的
+                match = next((m for m in all_models if keyword in m), None)
                 if match:
-                    target_model_name = match
+                    target_model = match
                     break
             
-            if not target_model_name and available_models:
-                target_model_name = available_models[0] # 隨便抓一個備用
-
-            if target_model_name:
-                self.model_name = target_model_name
-                self.active_model = genai.GenerativeModel(target_model_name)
-                # print(f"AI 初始化成功，使用模型: {self.model_name}") 
+            # 4. 如果都沒對到，就直接拿清單裡的第一個 (保底)
+            if not target_model and all_models:
+                target_model = all_models[0]
+            
+            if target_model:
+                self.model_name = target_model
+                self.active_model = genai.GenerativeModel(target_model)
+                print(f"✅ 成功鎖定模型: {target_model}")
             else:
-                st.error("❌ 找不到任何可用的 Gemini 模型。")
+                st.error("❌ 找不到任何可用模型 (List is empty)")
 
         except Exception as e:
             st.error(f"❌ 初始化 AI 失敗: {str(e)}")
+
+    def add_document(self, text, source="System"):
+        if not text: return
+        doc_entry = f"[{source}] {text}"
+        self.memory_docs.append(doc_entry)
+        try:
+            vec = genai.embed_content(model=self.embedding_model, content=text)['embedding']
+            self.memory_vecs.append(vec)
+            return True
+        except:
+            return False
+
+    def clear_memory(self):
+        self.memory_docs = []
+        self.memory_vecs = []
+
+    def query(self, user_question, top_k=4):
+        if not self.active_model: return f"❌ AI 初始化失敗。"
+        
+        context = ""
+        if self.memory_vecs:
+            try:
+                # Embedding 查詢
+                q_vec = genai.embed_content(model=self.embedding_model, content=user_question)['embedding']
+                scores = np.dot(self.memory_vecs, q_vec)
+                actual_k = min(len(self.memory_docs), top_k)
+                top_indices = np.argsort(scores)[-actual_k:][::-1]
+                context = "\n".join([self.memory_docs[i] for i in top_indices])
+            except:
+                context = "(向量檢索略過)"
+
+        try:
+            final_prompt = f"""
+            你是一位專業的財經分析師。請回答使用者的問題。
+            
+            【參考資訊】
+            {context}
+            
+            【使用者問題】
+            {user_question}
+            """
+            
+            response = self.active_model.generate_content(final_prompt)
+            return response.text + f"\n\n_(Model: {self.model_name})_"
+
+        except Exception as e:
+            return f"❌ 錯誤: {str(e)}"
+
+    def add_document(self, text, source="System"):
+        if not text: return
+        doc_entry = f"[{source}] {text}"
+        self.memory_docs.append(doc_entry)
+        try:
+            vec = genai.embed_content(model=self.embedding_model, content=text)['embedding']
+            self.memory_vecs.append(vec)
+            return True
+        except:
+            try:
+                vec = genai.embed_content(model="models/embedding-001", content=text)['embedding']
+                self.memory_vecs.append(vec)
+                return True
+            except: return False
+
+    def clear_memory(self):
+        self.memory_docs = []
+        self.memory_vecs = []
+
+    def query(self, user_question, top_k=4):
+        if not self.active_model: return f"❌ AI 初始化失敗 (無可用模型)。"
+        
+        # 如果記憶庫是空的，就不進行向量搜尋，直接回答
+        context = ""
+        if self.memory_vecs:
+            try:
+                # Embedding 查詢
+                try:
+                    q_vec = genai.embed_content(model=self.embedding_model, content=user_question)['embedding']
+                except:
+                    q_vec = genai.embed_content(model="models/embedding-001", content=user_question)['embedding']
+                
+                scores = np.dot(self.memory_vecs, q_vec)
+                actual_k = min(len(self.memory_docs), top_k)
+                top_indices = np.argsort(scores)[-actual_k:][::-1]
+                context = "\n".join([self.memory_docs[i] for i in top_indices])
+            except:
+                context = "(向量檢索失敗，僅依賴模型知識)"
+
+        try:
+            final_prompt = f"""
+            你是一位專業的財經分析師。請回答使用者的問題。
+            
+            【參考資訊】
+            {context}
+            
+            【使用者問題】
+            {user_question}
+            """
+            
+            response = self.active_model.generate_content(final_prompt)
+            return response.text + f"\n\n_(Model: {self.model_name})_"
+
+        except Exception as e:
+            error_str = str(e)
+            if "429" in error_str or "Quota" in error_str:
+                return "☕ **AI 需要休息一下 (429 Error)**\n\n您觸發了 Google 免費版 API 的頻率限制。\n建議等待 30 秒後再試。"
+            return f"❌ 錯誤: {error_str}"
 
     def add_document(self, text, source="System"):
         if not text: return
@@ -1943,11 +2102,25 @@ def page_ga():
                 
                 if tl: st.dataframe(pd.DataFrame(tl).style.applymap(highlight_trade_status, subset=['損益']), use_container_width=True, key=f"t_{idx}")
 # ==========================================
-# [V34.0] AI 自選股監控儀表板
+# [V34.1] AI 自選股監控儀表板 + 戰略參謀
 # ==========================================
 def page_watchlist():
     st.header("👀 AI 自選股戰情中心 (Smart Watchlist)")
-    
+
+    # ==========================================
+    # [修正] 強制在此頁面也能初始化 AI
+    # ==========================================
+    if 'rag_agent' not in st.session_state:
+        # 檢查是否有 API Key
+        if "AI_Studio_Key" in st.secrets:
+            try:
+                # 這裡會呼叫 RAGAdvisor (記得確保 RAGAdvisor 類別已更新為 Flash 版)
+                st.session_state.rag_agent = RAGAdvisor(st.secrets["AI_Studio_Key"])
+            except Exception as e:
+                st.warning(f"⚠️ AI 初始化異常: {str(e)}")
+        else:
+            st.warning("⚠️ 請在 secrets.toml 設定 AI_Studio_Key 才能使用戰報功能")
+    # ==========================================
     watchlist = load_watchlist()
     
     # 新增股票輸入框
@@ -1964,12 +2137,12 @@ def page_watchlist():
 
     st.markdown("---")
     
-    # 批量下載數據以提升速度
+    # 1. 儀表板掃描 (維持 V34.0 的極速掃描)
     full_tickers = [f"{t}.TW" if t.isdigit() else t for t in watchlist]
     
     with st.spinner(f"正在掃描 {len(watchlist)} 檔自選股戰略狀態..."):
         try:
-            # 批量下載
+            # 批量下載 (只抓 3 個月夠算趨勢就好)
             batch_data = yf.download(full_tickers, period="3mo", group_by='ticker', threads=True, progress=False)
         except:
             st.error("連線失敗")
@@ -1977,102 +2150,161 @@ def page_watchlist():
 
     dashboard_data = []
     
+    # ... (這裡維持 V34.0 的儀表板計算邏輯，為節省篇幅略過重複部分，請保留原本的 for 迴圈與指標計算) ...
+    # 若您需要我完整重貼這段 for 迴圈請告訴我，否則請保留原本 V34.0 的 dashboard_data 計算邏輯
+    
+    # --- 為了完整性，這裡快速重現核心計算以便您直接複製貼上 ---
     for t_code in watchlist:
         full_code = f"{t_code}.TW" if t_code.isdigit() else t_code
         try:
-            # 處理單檔/多檔回傳格式差異
             if len(watchlist) == 1: df = batch_data
             else: df = batch_data[full_code]
             
             df = df.dropna(how='all')
             if df.empty or len(df) < 30: continue
             
-            # --- 計算關鍵戰略指標 ---
             last_c = df['Close'].iloc[-1]
             last_v = df['Volume'].iloc[-1]
-            
-            # 1. 趨勢訊號 (模擬 GA 策略邏輯)
             ma20 = df['Close'].rolling(20).mean().iloc[-1]
             ma60 = df['Close'].rolling(60).mean().iloc[-1]
             slope = (ma60 - df['Close'].rolling(60).mean().iloc[-2])
             
-            # 訊號判定
-            signal = "🛡️ 觀望"
-            sig_color = "gray"
-            action = "Hold/Wait"
-            
-            # 簡單版策略：均線多排 + 爆量 or 創高
+            # 簡單訊號判定
+            signal = "🛡️ 觀望"; sig_color = "gray"; action = "Hold"
             if last_c > ma20 and last_c > ma60 and slope > 0:
-                signal = "🚀 多頭"
-                sig_color = "red"
-                action = "Buy / Hold"
+                signal = "🚀 多頭"; sig_color = "red"; action = "Buy/Hold"
             elif last_c < ma60:
-                signal = "🛑 空頭"
-                sig_color = "green"
-                action = "Sell / Avoid"
+                signal = "🛑 空頭"; sig_color = "green"; action = "Avoid"
 
-            # 2. FIB 位階 (半年內)
-            h = df['High'].max()
-            l = df['Low'].min()
+            # FIB 位階
+            h = df['High'].max(); l = df['Low'].min()
             pos = (last_c - l) / (h - l) if (h-l) != 0 else 0.5
-            fib_str = f"{pos*100:.0f}%"
-            fib_desc = "低檔"
-            if pos > 0.8: fib_desc = "高檔過熱"
-            elif pos > 0.6: fib_desc = "強勢區"
-            elif pos < 0.2: fib_desc = "超跌區"
+            fib_desc = "高檔" if pos > 0.8 else "強勢" if pos > 0.6 else "低檔" if pos < 0.2 else "中位"
 
-            # 3. 籌碼雷達 (模擬主力資金流)
+            # 籌碼 (主力資金流)
             change = (last_c - df['Open'].iloc[-1]) / df['Open'].iloc[-1]
             force = change * last_v
-            chip_status = "😐 中性"
-            if force > 0 and change > 0.01: chip_status = "🔥 主力吸籌"
-            elif force < 0 and change < -0.01: chip_status = "🤮 主力倒貨"
+            chip_status = "🔥 吸籌" if (force > 0 and change > 0.01) else "🤮 倒貨" if (force < 0 and change < -0.01) else "😐 中性"
             
             dashboard_data.append({
-                "代號": t_code,
-                "現價": f"{last_c:.1f}",
-                "戰略訊號": signal,
-                "建議操作": action,
-                "FIB位階": f"{fib_desc} ({fib_str})",
-                "主力籌碼": chip_status
+                "代號": t_code, "現價": f"{last_c:.1f}", "戰略訊號": signal, 
+                "FIB位階": f"{fib_desc} ({pos*100:.0f}%)", "主力籌碼": chip_status
             })
+        except: continue
 
-        except Exception as e:
-            continue
-            
     # 顯示儀表板
     if dashboard_data:
         res_df = pd.DataFrame(dashboard_data)
-        
-        # 使用 style 上色
         def color_signal(val):
-            color = 'white'
-            if '🚀' in val: color = '#ff4b4b'
-            elif '🛑' in val: color = '#21c354'
-            return f'color: {color}; font-weight: bold'
-
-        def color_chip(val):
-            if '🔥' in val: return 'color: #ff4b4b'
-            if '🤮' in val: return 'color: #21c354'
+            if '🚀' in val: return 'color: #ff4b4b; font-weight: bold'
+            if '🛑' in val: return 'color: #21c354; font-weight: bold'
             return ''
+        def color_chip(val):
+            return 'color: #ff4b4b' if '🔥' in val else 'color: #21c354' if '🤮' in val else ''
 
         st.dataframe(
-            res_df.style.applymap(color_signal, subset=['戰略訊號'])
-                        .applymap(color_chip, subset=['主力籌碼']),
-            use_container_width=True,
-            height=35 + len(res_df)*35
+            res_df.style.applymap(color_signal, subset=['戰略訊號']).applymap(color_chip, subset=['主力籌碼']),
+            use_container_width=True, height=35 + len(res_df)*35
         )
-        
-        st.caption("💡 點擊上方欄位標題可排序。訊號基於標準趨勢策略生成。")
-        
-        # 快速跳轉分析
-        sel_stock = st.selectbox("🔍 選擇一檔進行深入戰情分析:", watchlist)
-        if st.button("🚀 進入戰情室"):
-            st.session_state.dash_current_stock = sel_stock
-            # 這裡需要一個 hack 來切換頁面，但在 Streamlit 原生不支援直接換頁
-            # 我們改為提示使用者
-            st.success(f"已鎖定 {sel_stock}！請點擊左側 sidebar 的「⚡ 全能達人戰情室」查看詳情。")
+    
+    st.markdown("---")
+    
+    # 2. [V34.1 新增] AI 戰略參謀控制台
+    st.subheader("🤖 AI 首席分析師：個股深度解盤")
+    
+    c_sel, c_btn = st.columns([3, 1])
+    with c_sel:
+        target_stock = st.selectbox("請選擇一檔股票進行 AI 診斷:", watchlist)
+    
+    with c_btn:
+        st.write("") # 排版用
+        st.write("")
+        btn_gen = st.button("✨ 生成 AI 戰報", type="primary", use_container_width=True)
 
+# ... (前面的代碼保持不變，直接從 if btn_gen and target_stock: 開始替換) ...
+
+    if btn_gen and target_stock:
+        agent = st.session_state.get('rag_agent')
+        if not agent or not agent.active_model:
+            st.error("❌ AI 模型未初始化，請檢查 API Key。")
+            return
+
+        with st.status("🧠 AI 正在分析戰情...", expanded=True) as status:
+            st.write("📥 正在調閱 K 線圖與技術指標...")
+            df_full = get_stock_data(target_stock, period="6mo")
+            if df_full.empty:
+                st.error("無法獲取數據"); return
+            df_full = calculate_indicators(df_full)
+            last = df_full.iloc[-1]
+            
+            st.write("📰 正在檢索近期新聞...")
+            news_items, _ = get_special_news_v28(target_stock, STOCK_NAMES.get(target_stock, target_stock))
+            news_summary = "\n".join([f"- {n['title']}" for n in news_items[:3]])
+            
+            st.write(f"🤖 正在撰寫分析報告 (Model: {agent.model_name})...")
+            
+            # ... (中間計算 ma_state, chip_state 等變數保持不變) ...
+            ma_state = "多頭排列" if last['Close'] > last['MA20'] and last['MA20'] > last['MA60'] else "空頭排列" if last['Close'] < last['MA20'] < last['MA60'] else "盤整震盪"
+            kd_state = f"K({last['K']:.1f})/D({last['D']:.1f})"
+            k_dir = "黃金交叉" if last['K'] > last['D'] else "死亡交叉"
+            change = (last['Close'] - df_full['Open'].iloc[-1]) / df_full['Open'].iloc[-1]
+            force_idx = change * last['Volume']
+            chip_state = "主力吸籌" if force_idx > 0 else "主力出貨" if force_idx < 0 else "不明顯"
+
+            prompt = f"""
+            你是一位擁有 20 年經驗的華爾街資深操盤手。請根據以下數據，為投資人撰寫一份 {target_stock} 的短評戰報 (約 100~150 字)。
+            
+            【技術面】
+            - 收盤價: {last['Close']}
+            - 均線狀態: {ma_state}
+            - KD指標: {kd_state}，呈現 {k_dir}
+            - MACD柱狀體: {last['Hist']:.2f}
+            
+            【籌碼與動能】
+            - 當日漲跌幅: {change:.2%}
+            - 主力資金流向模擬: {chip_state}
+            - RSI: {last['RSI']:.1f}
+            
+            【近期新聞標題】
+            {news_summary}
+            
+            【撰寫要求】
+            1. 風格：專業、犀利、果斷，使用 Emoji (🚀, ⚠️, 🛑) 增強可讀性。
+            2. 結構：先講結論 (看多/看空/觀望)，再講理由 (技術+籌碼)，最後給操作建議 (支撐/壓力)。
+            """
+            
+            # [V34.2] 自動重試機制 (Auto-Retry)
+            max_retries = 3
+            retry_delay = 22 # 錯誤訊息建議等待 21 秒，我們設 22 秒比較保險
+            
+            ai_reply = None
+            
+            for attempt in range(max_retries):
+                try:
+                    response = agent.active_model.generate_content(prompt)
+                    ai_reply = response.text
+                    break # 成功就跳出迴圈
+                except Exception as e:
+                    err_msg = str(e)
+                    if "429" in err_msg or "Quota" in err_msg:
+                        if attempt < max_retries - 1:
+                            st.warning(f"⚠️ AI 請求頻率過高 (429)，系統將休息 {retry_delay} 秒後自動重試 ({attempt+1}/{max_retries})...")
+                            time.sleep(retry_delay)
+                            continue
+                        else:
+                            st.error("❌ 已達重試上限，請稍後再試。")
+                    else:
+                        st.error(f"❌ 未知錯誤: {err_msg}")
+                        break
+
+            if ai_reply:
+                status.update(label="✅ 戰報生成完畢！", state="complete", expanded=False)
+                st.markdown(f"### 📝 {target_stock} AI 戰略參謀報告")
+                st.info(ai_reply)
+                
+                if st.button(f"🚀 進入 {target_stock} 戰情室看圖", key="btn_go_dash"):
+                    st.session_state.dash_current_stock = target_stock
+                    st.success(f"已鎖定 {target_stock}，請切換至「戰情室」頁面。")
 
 # ==========================================
 # 4. 主程式入口
