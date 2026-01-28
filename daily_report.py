@@ -18,23 +18,59 @@ from oauth2client.service_account import ServiceAccountCredentials
 warnings.filterwarnings("ignore")
 
 # ==========================================
-# 1. 設定區 (讀取 GitHub Secrets)
+# 1. 設定區 (偵錯模式)
 # ==========================================
+print("🔍 [偵錯] 開始檢查環境變數...")
+
 EMAIL_SENDER = os.environ.get("EMAIL_SENDER")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
 EMAIL_RECEIVER = os.environ.get("EMAIL_RECEIVER", EMAIL_SENDER)
+
+# 檢查 Email 設定
+if not EMAIL_SENDER:
+    print("❌ [嚴重錯誤] 找不到 EMAIL_SENDER！請檢查 GitHub Secrets。")
+else:
+    print(f"✅ [檢查] EMAIL_SENDER 設定為: {EMAIL_SENDER[:3]}***@***")
+
+if not EMAIL_PASSWORD:
+    print("❌ [嚴重錯誤] 找不到 EMAIL_PASSWORD！")
+else:
+    print("✅ [檢查] EMAIL_PASSWORD 已設定")
+
+# 檢查 Google Sheet 設定
 SHEET_CREDENTIALS = os.environ.get("GOOGLE_SHEETS_CREDENTIALS")
+if not SHEET_CREDENTIALS:
+    print("⚠️ [警告] 找不到 Google Sheet 憑證，將跳過存檔。")
+else:
+    print("✅ [檢查] Google Sheet 憑證已設定")
+
 SHEET_URL = os.environ.get("GOOGLE_SHEET_URL")
 
 # 設定台灣時區
 TW_TZ = pytz.timezone('Asia/Taipei')
 
-# 載入板塊資料
-try:
-    with open("sector_db.json", "r", encoding="utf-8") as f:
-        SECTOR_DB = json.load(f)
-except:
-    SECTOR_DB = {} 
+# ==========================================
+# 1.2. 載入板塊資料 (偵錯模式)
+# ==========================================
+print("🔍 [偵錯] 準備載入 sector_db.json...")
+
+SECTOR_DB = {}
+if os.path.exists("sector_db.json"):
+    print("✅ [檢查] 檔案存在：sector_db.json")
+    try:
+        with open("sector_db.json", "r", encoding="utf-8") as f:
+            SECTOR_DB = json.load(f)
+        print(f"✅ [成功] JSON 載入成功，共包含 {len(SECTOR_DB)} 個大板塊")
+    except json.JSONDecodeError as e:
+        print(f"❌ [嚴重錯誤] JSON 格式錯誤！請檢查檔案內容。錯誤訊息: {e}")
+        # 這裡不給備用名單，直接讓它報錯，您才知道是格式錯了
+    except Exception as e:
+        print(f"❌ [未知錯誤] 讀取檔案失敗: {e}")
+else:
+    print("❌ [嚴重錯誤] 找不到 sector_db.json 檔案！請確認它在根目錄。")
+    print(f"📂 目前目錄檔案列表: {os.listdir('.')}") # 印出現在有哪些檔案
+
+# ==========================================
 
 # ==========================================
 # 2. 核心功能
@@ -221,3 +257,4 @@ if __name__ == "__main__":
         send_email(f"AI {subject_prefix} ({today_str}): 冠軍 {champ['代號']}", email_html)
     else:
         print("❌ 無掃描結果")
+
