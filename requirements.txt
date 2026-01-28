@@ -1,4 +1,4 @@
-streamlit
+streamlit>=1.35.0
 yfinance
 pandas
 numpy
@@ -10,3 +10,4 @@ snownlp
 
 requests
 google-generativeai>=0.7.0
+
