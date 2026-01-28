@@ -49,9 +49,9 @@ def calculate_score_batch(df):
         
         # --- 取最後一天數據 ---
         last_c = close.iloc[-1]
+        last_slope = ma60.diff().iloc[-1]
         last_ma20 = ma20.iloc[-1]
         last_ma60 = ma60.iloc[-1]
-        last_slope = ma60.diff().iloc[-1]
         last_vol = vol.iloc[-1]
         last_vol_ma = vol_ma20.iloc[-1]
         last_macd = macd.iloc[-1]
@@ -116,7 +116,6 @@ def run_scan_turbo():
         
         try:
             # 關鍵優化：一次下載 100 檔
-            # group_by='ticker' 讓回傳格式為 Dict-like: data['2330.TW'] = DataFrame
             data = yf.download(chunk, period="6mo", interval="1d", group_by='ticker', threads=True, progress=False)
             
             # 3. 處理資料
@@ -126,26 +125,27 @@ def run_scan_turbo():
                     if len(chunk) == 1:
                         df_t = data
                     else:
+                        if ticker not in data: continue
                         df_t = data[ticker]
                     
                     # 移除空值行
                     df_t = df_t.dropna(how='all')
                     
-                    if df_t.empty or df_t['Volume'].sum() == 0: continue
+                    if df_t.empty or len(df_t) < 60: continue
                     
                     res = calculate_score_batch(df_t)
                     if res:
                         res['代號'] = ticker
                         results.append(res)
                         
-                except KeyError:
-                    continue # 該股票可能下市或無資料
                 except Exception as e:
                     continue
-                    
+            
+            # 稍微冷卻避免被封鎖
+            time.sleep(1)
+
         except Exception as e:
             logging.error(f"❌ 批次下載失敗: {str(e)}")
-            time.sleep(5) # 稍微冷卻
 
     if not results:
         logging.error("❌ 掃描無結果")
@@ -162,7 +162,7 @@ def run_scan_turbo():
     return df_res
 
 # ==========================================
-# 3. Email 發送 (維持原樣)
+# 3. Email 發送
 # ==========================================
 def send_email(df_res):
     sender = os.environ.get("EMAIL_SENDER")
@@ -210,7 +210,10 @@ def send_email(df_res):
                 </tr>
                 {table_html}
             </table>
-            <p style="text-align: center; color: gray; font-size: 12px;">GitHub Turbo Mode: 掃描 {len(df_res)} 檔完成。</p>
+            <p style="text-align: center; color: gray; font-size: 12px;">
+                GitHub Turbo Mode (Batch Download)<br>
+                掃描 {len(df_res)} 檔完成。
+            </p>
         </div>
     </body>
     </html>
