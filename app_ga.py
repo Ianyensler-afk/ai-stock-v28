@@ -1,11 +1,4 @@
 import logging
-
-# [V31.2] 系統警示消音器
-# 忽略 Streamlit 多執行緒的 Context 警告 (因為我們只做純運算，這是安全的)
-logging.getLogger('streamlit.runtime.scriptrunner_utils.script_run_context').setLevel(logging.ERROR)
-logging.getLogger('streamlit.runtime.scriptrunner.script_run_context').setLevel(logging.ERROR)
-
-# ... (接著原本的 import streamlit as st 等等) ...
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -18,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 import requests
 import xml.etree.ElementTree as ET
 import email.utils 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from scipy.signal import argrelextrema 
 import json
 import smtplib
@@ -26,6 +19,12 @@ import google.generativeai as genai
 import os
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+import sqlite3
+import random
+
+# [V31.2] 系統警示消音器
+logging.getLogger('streamlit.runtime.scriptrunner_utils.script_run_context').setLevel(logging.ERROR)
+logging.getLogger('streamlit.runtime.scriptrunner.script_run_context').setLevel(logging.ERROR)
 
 # 忽略警告
 warnings.filterwarnings("ignore")
@@ -42,7 +41,7 @@ try:
     HAS_SNOWNLP = True
 except ImportError:
     HAS_SNOWNLP = False
-# --- [V28.0 新增] 檢查 NLP 與 統計套件 ---
+
 try:
     import jieba
     import jieba.analyse
@@ -50,9 +49,9 @@ try:
 except ImportError:
     HAS_JIEBA = False
 
-from scipy.stats import pearsonr # 用於計算板塊相關性
+from scipy.stats import pearsonr 
 
-# [V27.2] 自定義 JSON 編碼器，解決 int64 錯誤
+# [V27.2] 自定義 JSON 編碼器
 class NumpyEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, (np.int_, np.intc, np.intp, np.int8,
@@ -66,16 +65,15 @@ class NumpyEncoder(json.JSONEncoder):
         return json.JSONEncoder.default(self, obj)
 
 # ==========================================
-# 0. 全域設定與 CSS (V27.10 兼容性修復版)
+# 0. 全域設定
 # ==========================================
-st.set_page_config(page_title="AI 戰情室: V27.10 終極修復版", layout="wide", page_icon="⚡")
+st.set_page_config(page_title="AI 戰情室: V33.6 精簡優化版", layout="wide", page_icon="⚡")
 
 st.markdown("""
     <style>
     .stButton>button { width: 100%; border-radius: 20px; }
     .stDataFrame { border: 1px solid #ddd; } 
     button[data-baseweb="tab"] { font-size: 1.2em; font-weight: bold; }
-    /* [V28.1 新增] 緊湊型股票標籤樣式 */
     .stock-tag {
         display: inline-block; 
         padding: 2px 8px; 
@@ -89,13 +87,6 @@ st.markdown("""
     }
     .stock-tag:hover { background-color: #d1d5db; color: #000; border-color: #999; }
     
-    .link-btn {
-        text-decoration: none; display: inline-block; padding: 8px 16px;
-        border-radius: 5px; background-color: #f0f2f6; color: #31333F;
-        border: 1px solid #d0d2d6; margin: 5px; font-size: 0.9em; font-weight: bold;
-    }
-    .link-btn:hover { background-color: #e0e2e6; border-color: #00adb5; color: #00adb5; }
-            
     .link-btn {
         text-decoration: none; display: inline-block; padding: 8px 16px;
         border-radius: 5px; background-color: #f0f2f6; color: #31333F;
@@ -132,24 +123,172 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# 產業資料庫
 # ==========================================
-# 0.5 資料庫載入區 (V3.5 修復版 - 解決 NameError)
+# 核心類別：資料庫與 RAG
 # ==========================================
-import os
 
-# 1. [絕對關鍵] 先定義全域變數，防止程式讀不到報錯
+class BattleDB:
+    def __init__(self, db_name="strategy.db"):
+        self.db_name = db_name
+        self.create_tables()
+
+    def get_connection(self):
+        return sqlite3.connect(self.db_name, check_same_thread=False)
+
+    def create_tables(self):
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS strategy_genes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                ticker TEXT,
+                strategy_name TEXT,
+                total_return REAL,
+                sharpe_ratio REAL,
+                params TEXT,
+                note TEXT
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS scan_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                scope TEXT,
+                champion_code TEXT,
+                champion_score REAL,
+                report_json TEXT
+            )
+        ''')
+        conn.commit()
+        conn.close()
+
+    def save_gene(self, ticker, strat_name, ret, sharpe, params, note=""):
+        conn = self.get_connection()
+        p_str = json.dumps(params, cls=NumpyEncoder)
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute("INSERT INTO strategy_genes (timestamp, ticker, strategy_name, total_return, sharpe_ratio, params, note) VALUES (?, ?, ?, ?, ?, ?, ?)", 
+                     (ts, ticker, strat_name, ret, sharpe, p_str, note))
+        conn.commit()
+        conn.close()
+        return "✅ 基因已永久入庫！"
+
+    def save_scan_report(self, scope, champion, score, report_json):
+        conn = self.get_connection()
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute("INSERT INTO scan_reports (timestamp, scope, champion_code, champion_score, report_json) VALUES (?, ?, ?, ?, ?)",
+                     (ts, scope, champion, score, report_json))
+        conn.commit()
+        conn.close()
+
+class RAGAdvisor:
+    def __init__(self, api_key):
+        genai.configure(api_key=api_key)
+        self.embedding_model = "models/text-embedding-004"
+        self.active_model = None
+        self.model_name = "未偵測"
+        self.memory_docs = []
+        self.memory_vecs = []
+
+        try:
+            # [V33.7 修改] 優先順序調整：先 Flash (高額度) -> 再 Pro (高品質) -> 最後 Default
+            # 這樣可以避免一開始就撞牆 429 錯誤
+            priority_models = ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
+            
+            available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
+            
+            target_model_name = None
+            for p_model in priority_models:
+                # 模糊比對，例如找到 'models/gemini-1.5-flash-001'
+                match = next((m for m in available_models if p_model in m), None)
+                if match:
+                    target_model_name = match
+                    break
+            
+            if not target_model_name and available_models:
+                target_model_name = available_models[0] # 隨便抓一個備用
+
+            if target_model_name:
+                self.model_name = target_model_name
+                self.active_model = genai.GenerativeModel(target_model_name)
+                # print(f"AI 初始化成功，使用模型: {self.model_name}") 
+            else:
+                st.error("❌ 找不到任何可用的 Gemini 模型。")
+
+        except Exception as e:
+            st.error(f"❌ 初始化 AI 失敗: {str(e)}")
+
+    def add_document(self, text, source="System"):
+        if not text: return
+        doc_entry = f"[{source}] {text}"
+        self.memory_docs.append(doc_entry)
+        try:
+            # 嘗試使用新版 Embedding
+            vec = genai.embed_content(model=self.embedding_model, content=text)['embedding']
+            self.memory_vecs.append(vec)
+            return True
+        except:
+            try:
+                # 備援：舊版 Embedding
+                vec = genai.embed_content(model="models/embedding-001", content=text)['embedding']
+                self.memory_vecs.append(vec)
+                return True
+            except: return False
+
+    def clear_memory(self):
+        self.memory_docs = []
+        self.memory_vecs = []
+
+    # 修改 query 函數，將 top_k 預設值降低，並優化錯誤捕捉
+    def query(self, user_question, top_k=4): # [修改] 降回 4 以節省 Token
+        if not self.active_model: return f"❌ AI 初始化失敗。"
+        if not self.memory_vecs: return "⚠️ 腦袋空空，請先點擊「📥 載入個股大腦」。"
+
+        try:
+            # 1. Embedding 查詢
+            try:
+                q_vec = genai.embed_content(model=self.embedding_model, content=user_question)['embedding']
+            except:
+                q_vec = genai.embed_content(model="models/embedding-001", content=user_question)['embedding']
+            
+            scores = np.dot(self.memory_vecs, q_vec)
+            # [修改] 限制讀取資料量，避免一次消耗太多 Token
+            actual_k = min(len(self.memory_docs), top_k)
+            top_indices = np.argsort(scores)[-actual_k:][::-1]
+            context = "\n".join([self.memory_docs[i] for i in top_indices])
+            
+            final_prompt = f"""
+            你是一位專業的財經分析師。請根據以下「背景資訊」回答使用者的問題。
+            若遇到與「股價」或「財務數據」相關問題，請務必引用背景資訊中的數值。
+            
+            【背景資訊】
+            {context}
+            
+            【使用者問題】
+            {user_question}
+            """
+            
+            response = self.active_model.generate_content(final_prompt)
+            return response.text + f"\n\n_(Model: {self.model_name})_"
+
+        except Exception as e:
+            error_str = str(e)
+            if "429" in error_str or "Quota" in error_str:
+                return "☕ **AI 需要休息一下 (429 Error)**\n\n您觸發了 Google 免費版 API 的頻率限制。\n建議：\n1. 等待 1~2 分鐘後再試。\n2. 不要連續快速點擊「發問」。"
+            return f"❌ 錯誤: {error_str}"
+
+db_manager = BattleDB()
+
+# ==========================================
+# 0.5 資料庫載入區
+# ==========================================
 STOCK_NAMES = {} 
-
-# 預設資料庫 (備用，防止 json 讀取失敗時全空)
 DEFAULT_SECTOR_DB = {
     "💎 半導體 (範例)": {"1. 上游": ["2330.TW", "2454.TW"]}
 }
 
 def load_external_data():
-    global STOCK_NAMES # 宣告我們要修改全域變數
-    
-    # 載入產業分類
+    global STOCK_NAMES
     sector_data = DEFAULT_SECTOR_DB
     if os.path.exists("sector_db.json"):
         try:
@@ -157,57 +296,56 @@ def load_external_data():
                 sector_data = json.load(f)
         except: pass
     
-    # 載入股票名稱
     if os.path.exists("stock_names.json"):
         try:
             with open("stock_names.json", "r", encoding="utf-8") as f:
                 external_names = json.load(f)
-                # 將載入的名稱更新到全域變數中
                 STOCK_NAMES.update(external_names)
         except: pass
         
     return sector_data
 
-# 執行載入 (這行會填滿 SECTOR_DB 和 STOCK_NAMES)
 SECTOR_DB = load_external_data()
-
 
 # ==========================================
 # 1. 核心工具 (ETL)
 # ==========================================
 
-# [V31.5] 強化的數據獲取函數 (抗阻擋版)
-import random
+# [V33.4] 即時報價
+def get_realtime_quote(ticker):
+    try:
+        if ticker.isdigit(): t = f"{ticker}.TW"
+        else: t = ticker
+        stock = yf.Ticker(t)
+        df = stock.history(period='1d', interval='1m')
+        if not df.empty:
+            return df['Close'].iloc[-1], df.index[-1]
+    except: pass
+    return None, None
 
+# [V33.5] 增強型爬蟲 (Anti-Blocking)
 @st.cache_data(ttl=600)
 def get_stock_data(ticker, period="2y"):
-    # 偽裝成瀏覽器的 Header
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
-
-    # 處理代號格式
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0.3 Safari/605.1.15",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:89.0) Gecko/20100101 Firefox/89.0",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36"
+    ]
+    
     tickers_to_try = [ticker]
     if ticker.isdigit(): tickers_to_try = [f"{ticker}.TW", f"{ticker}.TWO"]
     elif not ticker.endswith(".TW") and not ticker.endswith(".TWO") and not ticker.isalpha(): 
         tickers_to_try = [f"{ticker}.TW"]
     
-    # 開始嘗試
     for t in tickers_to_try:
-        # [V31.5 新增] 重試迴圈 (Max 3次)
-        for attempt in range(3):
+        for attempt in range(2): 
             try:
-                # 建立 Ticker 物件 (yfinance 內部會處理 session，但我們可以透過延遲來優化)
                 stock = yf.Ticker(t)
-                
-                # 下載數據
                 temp = stock.history(period=period)
                 
-                # 判定是否成功
-                if not temp.empty and len(temp) > 30: 
+                if not temp.empty and len(temp) > 60: 
                     df = temp
-                    
-                    # --- 資料清洗標準程序 ---
                     if df.index.tz is not None: df.index = df.index.tz_localize(None)
                     df = df[~df.index.duplicated(keep='first')] 
                     target_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
@@ -220,17 +358,12 @@ def get_stock_data(ticker, period="2y"):
                     
                     clean_df = clean_df.ffill().bfill().fillna(0)
                     return clean_df.astype(float)
-                
                 else:
-                    # 抓不到資料，休息一下再試 (Random Sleep 0.5 ~ 2.0s)
-                    time.sleep(random.uniform(0.5, 2.0))
-                    
-            except Exception as e:
-                # 發生錯誤，休息久一點再試
-                time.sleep(random.uniform(1.0, 3.0))
+                    time.sleep(random.uniform(1.0, 2.0))
+            except Exception:
+                time.sleep(random.uniform(1.0, 2.0))
                 continue
                 
-    # 試了所有方法都失敗，回傳空
     return pd.DataFrame()
 
 @st.cache_data(ttl=3600)
@@ -242,20 +375,19 @@ def get_stock_info(ticker):
     except: return {}
 
 @st.cache_data(ttl=300)
-@st.cache_data(ttl=300)
 def get_special_news_v28(ticker, name):
-    # 保留原本的爬蟲邏輯，但在最後加入 NLP 分析
     core_ticker = ticker.replace(".TW", "").replace(".TWO", "")
+    # 這裡就是 RAG 大腦的「白名單」資料來源
     target_sites = ["money.udn.com", "moneydj.com", "investor.com.tw", "sinotrade.com.tw", "ctee.com.tw"]
     site_query = " OR ".join([f"site:{site}" for site in target_sites])
     query = f"{name} {core_ticker} ({site_query})"
     rss_url = f"https://news.google.com/rss/search?q={query}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant&tbs=qdr:m3"
     
     news_items = []
-    all_titles = "" # 用於關鍵字分析
+    all_titles = "" 
     
     try:
-        response = requests.get(rss_url, timeout=5)
+        response = requests.get(rss_url, timeout=3)
         if response.status_code == 200:
             root = ET.fromstring(response.content)
             tw_tz = timezone(timedelta(hours=8))
@@ -264,13 +396,11 @@ def get_special_news_v28(ticker, name):
                 title_text = item.find('title').text
                 all_titles += title_text + " "
                 
-                # Sentiment (維持 V27 邏輯，但增加權重)
                 score = 0.5
                 sentiment_label = "中性"; sentiment_color = "sent-neu"
                 if HAS_SNOWNLP:
                     s = SnowNLP(title_text); score = s.sentiments
                 
-                # 關鍵字加權 (手動補強 SnowNLP 的不足)
                 bull_tags = ['創新高', '漲停', '獲利', '優於', '三率三升', '擴產', '急單']
                 bear_tags = ['跌停', '重挫', '不如', '衰退', '虧損', '裁員', '降評']
                 for w in bull_tags: 
@@ -295,7 +425,6 @@ def get_special_news_v28(ticker, name):
                     'sent_label': sentiment_label, 'sent_color': sentiment_color
                 })
             
-            # [V28.0 新增] NLP 關鍵字萃取
             top_keywords = []
             if HAS_JIEBA and all_titles:
                 tags = jieba.analyse.extract_tags(all_titles, topK=5)
@@ -349,7 +478,6 @@ def calculate_indicators(df):
 
 @st.cache_data(ttl=1800)
 def analyze_sector_linkage(ticker, period="6mo"):
-    # 1. 找出同板塊的股票
     core_ticker = ticker.replace(".TW", "").replace(".TWO", "")
     my_sector = "未知"
     peers = []
@@ -359,12 +487,11 @@ def analyze_sector_linkage(ticker, period="6mo"):
             clean_tickers = [t.replace(".TW", "").replace(".TWO", "") for t in tickers]
             if core_ticker in clean_tickers:
                 my_sector = sub
-                peers = [t for t in tickers if t.replace(".TW","").replace(".TWO","") != core_ticker][:4] # 取前4檔做比較
+                peers = [t for t in tickers if t.replace(".TW","").replace(".TWO","") != core_ticker][:4] 
                 break
     
     if not peers: return None
     
-    # 2. 抓取資料並計算相關性
     main_df = get_stock_data(ticker, period=period)
     if main_df.empty: return None
     
@@ -375,7 +502,6 @@ def analyze_sector_linkage(ticker, period="6mo"):
     for p in peers:
         p_df = get_stock_data(p, period=period)
         if not p_df.empty:
-            # 對齊資料
             aligned_df = pd.DataFrame({'Main': main_df['Close'], 'Peer': p_df['Close']}).dropna()
             if len(aligned_df) > 30:
                 corr, _ = pearsonr(aligned_df['Main'], aligned_df['Peer'])
@@ -383,7 +509,6 @@ def analyze_sector_linkage(ticker, period="6mo"):
                 peer_corr[peer_name] = corr
                 sector_trend[peer_name] = p_df['Close']
     
-    # 計算板塊平均走勢 (標準化後)
     normalized = sector_trend / sector_trend.iloc[0]
     avg_trend = normalized.mean(axis=1)
     
@@ -405,70 +530,27 @@ def generate_battle_report(top_stock, scan_results):
             "score": top_stock['總分'],
             "price": top_stock['現價']
         },
-        "top_3_list": scan_results[:3], # 取前三名
+        "top_3_list": scan_results[:3], 
         "market_summary": f"本次掃描 {len(scan_results)} 檔股票，冠軍由 {top_stock['名稱']} 奪得，總分 {top_stock['總分']} 分。"
     }
     return json.dumps(report_data, ensure_ascii=False, indent=2, cls=NumpyEncoder)
 
-def generate_app_report(ticker, df, res):
-    strat_name = res['strat_name']
-    total_ret = res['total_ret']
-    mdd = res['mdd']
-    pos = res['pos'].iloc[-1]
-    
-    last_date = df.index[-1].strftime("%Y-%m-%d")
-    last_close = df['Close'].iloc[-1]
-    last_signal = "買進/持有" if pos == 1 else "賣出/空手"
-    
-    trade_count = 0
-    if 'pos' in res:
-        trades = res['pos'].diff().fillna(0).abs()
-        trade_count = trades.sum() / 2
-    
-    report_data = {
-        "report_type": "GA_Strategy_Evolution",
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "target": {
-            "code": ticker,
-            "last_price": last_close,
-            "date": last_date
-        },
-        "strategy": {
-            "name": strat_name,
-            "signal": last_signal,
-            "backtest_performance": {
-                "total_return_pct": round(total_ret * 100, 2),
-                "max_drawdown_pct": round(mdd * 100, 2),
-                "estimated_trades": int(trade_count)
-            }
-        },
-        "message": f"AI 演化完畢。最佳策略為 [{strat_name}]，回測報酬率 {total_ret:.1%}，目前建議：{last_signal}。"
-    }
-    return report_data
-
-# ==========================================
-# [V29.3] Email SMTP 模組 (永久免費穩定版)
-# ==========================================
 def send_email_report(subject, html_content):
-    # 1. 檢查 Secrets
     if 'email_sender' not in st.secrets or 'email_password' not in st.secrets:
         return False, "❌ 未設定 Email 帳號或應用程式密碼"
 
     sender = st.secrets['email_sender']
     password = st.secrets['email_password']
-    receiver = st.secrets.get('email_receiver', sender) # 若沒設接收者，預設寄給自己
+    receiver = st.secrets.get('email_receiver', sender) 
     
-    # 2. 建構郵件
     msg = MIMEMultipart()
     msg['From'] = f"AI 戰情室 <{sender}>"
     msg['To'] = receiver
     msg['Subject'] = subject
     
-    # 支援 HTML 格式
     msg.attach(MIMEText(html_content, 'html'))
     
     try:
-        # 3. 連接 Gmail SMTP Server (SSL Port 465)
         server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
         server.login(sender, password)
         server.sendmail(sender, receiver, msg.as_string())
@@ -476,44 +558,88 @@ def send_email_report(subject, html_content):
         return True, f"✅ 戰報已寄至 {receiver}！"
     except Exception as e:
         return False, f"❌ 發送失敗: {str(e)}"
-    
 
+# [V33.7 修改] 強化版爬蟲：加入重試機制 (Retry) 與 錯誤分類
 def process_stock_task(ticker):
-    try:
-        # [V27.10] 隨機延遲，防止 IP 被鎖
-        import random
-        time.sleep(random.uniform(0.1, 0.5))
-        
-        name = STOCK_NAMES.get(ticker, ticker)
-        df = get_stock_data(ticker)
-        if df.empty or len(df) < 100: return None
-        df = calculate_indicators(df)
-        info = get_stock_info(ticker) 
-        last = df.iloc[-1]
-        t_score = 0
-        if last['Close'] > last['MA20']: t_score += 2
-        if last['MA60_Slope'] > 0: t_score += 3 
-        if last['Close'] > last['MA60']: t_score += 1
-        if last['MACD'] > last['Signal']: t_score += 2
-        if last['RSI'] > 50: t_score += 2
-        c_score = 0
-        if last['OBV'] > df['OBV_MA'].iloc[-1]: c_score += 4 
-        if last['Volume'] > df['VolMA20'].iloc[-1]: c_score += 3 
-        if (last['Close'] - last['Open']) > 0: c_score += 3 
-        m_score = 0
-        ret_1m = (last['Close'] / df['Close'].iloc[-20]) - 1
-        if ret_1m > 0: m_score += 5
-        if ret_1m > 0.05: m_score += 5 
-        f_score = 5 
-        if info:
+    # 設定重試次數
+    max_retries = 3
+    
+    for attempt in range(max_retries):
+        try:
+            # 隨機延遲，避免同時發送請求被封鎖
+            time.sleep(random.uniform(0.3, 0.8))
+            
+            name = STOCK_NAMES.get(ticker, ticker)
+            
+            # 呼叫資料獲取函數 (假設 get_stock_data 內部有 yfinance 邏輯)
+            df = get_stock_data(ticker)
+            
+            # [檢查點 1] 下載是否成功？
+            if df.empty:
+                # 如果是最後一次嘗試仍失敗，才回傳錯誤
+                if attempt == max_retries - 1:
+                    return {"status": "fail", "code": ticker, "reason": "下載無資料(Empty)"}
+                continue # 重試
+            
+            # [檢查點 2] 資料長度是否足夠？(過濾新上市或資料殘缺)
+            if len(df) < 60:
+                return {"status": "fail", "code": ticker, "reason": "資料不足(<60天)"}
+            
+            # [檢查點 3] 殭屍股過濾 (最近5天無量 或 收盤價<=0)
+            if df['Volume'].iloc[-5:].sum() == 0 or df['Close'].iloc[-1] <= 0:
+                return {"status": "fail", "code": ticker, "reason": "殭屍股/無量"}
+
+            # [檢查點 4] 嘗試修補 NaN
+            if df[['Open', 'High', 'Low', 'Close']].isnull().values.any():
+                 df = df.fillna(method='ffill').fillna(method='bfill')
+
+            # --- 開始計算分數 (邏輯不變) ---
+            df = calculate_indicators(df)
+            last = df.iloc[-1]
+            
+            t_score = 0
+            if last['Close'] > last['MA20']: t_score += 2
+            if last['MA60_Slope'] > 0: t_score += 3 
+            if last['Close'] > last['MA60']: t_score += 1
+            if last['MACD'] > last['Signal']: t_score += 2
+            if last['RSI'] > 50: t_score += 2
+            
+            c_score = 0
+            if last['OBV'] > df['OBV_MA'].iloc[-1]: c_score += 4 
+            if last['Volume'] > df['VolMA20'].iloc[-1]: c_score += 3 
+            if (last['Close'] - last['Open']) > 0: c_score += 3 
+            
+            m_score = 0
             try:
-                pe = info.get('trailingPE', 0); pb = info.get('priceToBook', 0)
-                if 0 < pe < 25: f_score += 2
-                if 0 < pb < 4: f_score += 2
-            except: pass
-        total_score = t_score + c_score + m_score + f_score
-        return {"代號": ticker, "名稱": name, "總分": total_score, "T-技術": t_score, "C-籌碼": c_score, "M-動能": m_score, "F-基本": f_score, "現價": last['Close'], "斜率": "⬆️" if last['MA60_Slope'] > 0 else "⬇️"}
-    except: return None
+                ret_1m = (last['Close'] / df['Close'].iloc[-20]) - 1
+            except: ret_1m = 0
+            if ret_1m > 0: m_score += 5
+            if ret_1m > 0.05: m_score += 5 
+            
+            f_score = 5 # 基礎分
+            # 注意：get_stock_info 比較耗時，若為了加速可考慮移除或設為選填
+            # info = get_stock_info(ticker) 
+            # ... (基本面邏輯) ...
+            
+            total_score = t_score + c_score + m_score + f_score
+            
+            return {
+                "status": "ok", 
+                "代號": ticker, 
+                "名稱": name, 
+                "總分": total_score, 
+                "現價": last['Close'], 
+                "斜率": "⬆️" if last['MA60_Slope'] > 0 else "⬇️"
+            }
+
+        except Exception as e:
+            # 遇到網路錯誤，等待後重試
+            if attempt < max_retries - 1:
+                time.sleep(2) # 發生錯誤時，睡久一點避風頭
+                continue
+            return {"status": "error", "code": ticker, "reason": str(e)}
+            
+    return {"status": "fail", "code": ticker, "reason": "Unknown"}
 
 # ==========================================
 # 2. 策略核心
@@ -537,10 +663,7 @@ def calculate_supertrend_core(high, low, close, atr, period, multiplier):
             else: trend[i] = -1
     return trend, supertrend
 
-# [V27.10] 核心策略執行函數 (補回遺失的部分)
-# [V28.0] 核心策略執行函數 (包含夏普與勝率計算)
 def run_strategy_multi(data_dict, strategy_type, p1, p2, p3, sl_atr, tp_atr, vol_factor, trend_filter_mode, risk_per_trade):
-    # --- 0. 數據預處理 ---
     closes = data_dict['close']; highs = data_dict['high']; lows = data_dict['low']; opens = data_dict['open']
     volumes = data_dict['volume']; atrs = data_dict['atr']; adxs = data_dict['adx']
     vol_mas = data_dict['vol_ma']; ma60s = data_dict['ma60']; ma200s = data_dict['ma200']
@@ -548,7 +671,6 @@ def run_strategy_multi(data_dict, strategy_type, p1, p2, p3, sl_atr, tp_atr, vol
     rsis = data_dict['rsi']; bb_ups = data_dict['bbu']; ma20s = data_dict['ma20']
     don_h = data_dict['don_h']; don_l = data_dict['don_l']
     
-    # 預算 MACD
     exp12 = pd.Series(closes).ewm(span=12, adjust=False).mean()
     exp26 = pd.Series(closes).ewm(span=26, adjust=False).mean()
     macd_line = exp12 - exp26
@@ -560,25 +682,22 @@ def run_strategy_multi(data_dict, strategy_type, p1, p2, p3, sl_atr, tp_atr, vol
     n = len(closes)
     strategy_mode = int(strategy_type) % 4
     
-    # --- 1. 產生基礎訊號 ---
     raw_signal = np.zeros(n, dtype=bool)
 
-    # 計算 SuperTrend
     atr_p_st = int(p1); mult_st = p2 / 10.0
     st_trends, st_line = calculate_supertrend_core(highs, lows, closes, atrs, atr_p_st, mult_st)
 
-    if strategy_mode == 0: # SuperTrend
+    if strategy_mode == 0: 
         adx_thresh = int(p3)
         raw_signal = (st_trends == 1) & (adxs > adx_thresh)
-    elif strategy_mode == 1: # RSI
+    elif strategy_mode == 1: 
         buy_level = 30 + (p2/2)
         raw_signal = (rsis < buy_level)
-    elif strategy_mode == 2: # BB Breakout
+    elif strategy_mode == 2: 
         raw_signal = (closes > bb_ups)
-    elif strategy_mode == 3: # Turtle
+    elif strategy_mode == 3: 
         raw_signal = (closes > don_h)
         
-    # --- 2. 智慧濾網 ---
     pass_vol = (volumes > vol_mas * vol_factor) | (vol_factor <= 0.3)
     
     is_volume_spike = volumes > (vol_mas * 1.5)
@@ -589,7 +708,6 @@ def run_strategy_multi(data_dict, strategy_type, p1, p2, p3, sl_atr, tp_atr, vol
     is_crashing = (ma60_slopes < -0.5)
     is_early_bull = (closes > ma20s) & (closes > np.roll(ma20s, 1))
     
-    # --- 3. 核心迴圈 ---
     pos_list = np.zeros(n, dtype=int)
     entry_reasons = np.zeros(n, dtype=int) 
     
@@ -597,7 +715,6 @@ def run_strategy_multi(data_dict, strategy_type, p1, p2, p3, sl_atr, tp_atr, vol
     warmup = 60
     
     for i in range(warmup, n):
-        # A. 進場
         if current_pos == 0:
             can_trade = False
             reason_code = 0
@@ -619,7 +736,6 @@ def run_strategy_multi(data_dict, strategy_type, p1, p2, p3, sl_atr, tp_atr, vol
                 dynamic_sl = entry_price - (atrs[i] * sl_atr)
                 entry_reasons[i] = reason_code 
         
-        # B. 出場
         elif current_pos == 1:
             hard_sl = entry_price - (atrs[i] * sl_atr)
             current_tp_dist = (atrs[i] * tp_atr)
@@ -642,7 +758,6 @@ def run_strategy_multi(data_dict, strategy_type, p1, p2, p3, sl_atr, tp_atr, vol
                 
         pos_list[i] = current_pos
         
-    # --- 4. 績效結算 ---
     ret_arr = data_dict['raw_ret']
     strategy_ret = pos_list[:-1] * ret_arr[1:]
     trades = np.abs(np.diff(pos_list))
@@ -656,7 +771,6 @@ def run_strategy_multi(data_dict, strategy_type, p1, p2, p3, sl_atr, tp_atr, vol
     mdd = np.min((cum_ret - running_max) / running_max)
     strat_names = {0:"SuperTrend", 1:"RSI逆勢", 2:"布林突破", 3:"海龜交易"}
 
-    # [V28.0 新增] 計算 Sharpe 與 勝率
     daily_rets = pd.Series(strategy_ret).fillna(0)
     avg_daily_ret = daily_rets.mean()
     std_daily_ret = daily_rets.std()
@@ -665,7 +779,6 @@ def run_strategy_multi(data_dict, strategy_type, p1, p2, p3, sl_atr, tp_atr, vol
     if std_daily_ret != 0:
         sharpe_ratio = (avg_daily_ret / std_daily_ret) * (252 ** 0.5)
         
-    # 勝率計算
     trade_pnl = []
     curr_p = 0; entry_p = 0
     for idx, p in enumerate(pos_list):
@@ -679,13 +792,7 @@ def run_strategy_multi(data_dict, strategy_type, p1, p2, p3, sl_atr, tp_atr, vol
         wins = sum(1 for x in trade_pnl if x > 0)
         win_rate = wins / len(trade_pnl)
     
-    # 回傳 10 個值，解決錯誤
     return pos_list, np.concatenate(([1.0], cum_ret)), total_ret, mdd, strat_names[strategy_mode], st_line, st_trends, entry_reasons, sharpe_ratio, win_rate
-
-# ==========================================
-# [V27.10 補丁] 樣式小幫手 & 適應度函數
-# 請將此區塊放在 run_strategy_multi 之後，page_ga 之前
-# ==========================================
 
 def highlight_trade_status(val):
     val_str = str(val)
@@ -695,120 +802,52 @@ def highlight_trade_status(val):
     return ''
 
 def fitness_func(ga_instance, sol, idx):
-    # 讀取當前正在演化的模式
     current_mode = st.session_state.get('current_running_mode', "一般")
     
-    # 1. 解碼基因
     strat_type = sol[0]
     p1 = sol[1]; p2 = sol[2]; p3 = sol[3]
     sl_atr = sol[4]/10.0; tp_atr = sol[5]/10.0
     vol_factor = sol[6]/10.0
-    # 基因8: 趨勢濾網強度 (0=不看, 1=MA60, 2=MA200+斜率)
     trend_filter_mode = 1 if sol[7] > 5 else 0 
     risk = 0.01 
     
     data_dict = st.session_state.train_data_dict 
     
-   # 呼叫策略 (接收新的回傳值)
     res = run_strategy_multi(data_dict, strat_type, p1, p2, p3, sl_atr, tp_atr, vol_factor, trend_filter_mode, risk)
 
     if res is None: return -9999
-   # [V28.0] 接收 10 個回傳值
     pos, _, total_ret, mdd, _, _, _, _, sharpe, win_rate = res 
     
     trades = np.sum(np.abs(np.diff(pos))) / 2
     abs_mdd = abs(mdd)
     
-    if trades < 3: return -5000 # 交易次數過少懲罰
+    if trades < 3: return -5000 
     
     score = 0
 
-# [V28.0] 全新評分公式
     if "保守" in current_mode:
-        # 保守: 高權重在 MDD 與 夏普，要求勝率 > 50%
         if abs_mdd > 0.12: return -10000 * abs_mdd
         if win_rate < 0.4: score -= 2000
         score = (sharpe * 500) + (total_ret * 200) + (win_rate * 1000)
         
     elif "激進" in current_mode:
-        # 激進: 追求總報酬，夏普其次，接受 MDD
         if abs_mdd > 0.45: return -5000
         score = (total_ret * 3000) + (sharpe * 100)
         
     elif "狙擊" in current_mode:
-        # 狙擊: 極度要求勝率與盈虧比 (Sortino/Sharpe)
-        if win_rate < 0.6: score -= 5000 # 狙擊失敗懲罰
+        if win_rate < 0.6: score -= 5000 
         score = (sharpe * 1000) + (win_rate * 2000) + (total_ret * 500)
         
     return score
 
-    
-    # 防止過少交易 (倖存者偏差)
-    if trades < 3: return -5000
-    
-    score = 0
-    
-    if "保守" in current_mode:
-        # 🛡️ 保守型: 嚴禁大賠
-        if abs_mdd > 0.15: return -10000 * abs_mdd
-        score = (total_ret * 500) + (1 / (abs_mdd + 0.01) * 200)
-        
-    elif "激進" in current_mode:
-        # ⚔️ 激進型: 容忍波動，追求獲利
-        if abs_mdd > 0.40: return -5000
-        score = (total_ret * 2000) - (abs_mdd * 500)
-        
-    elif "狙擊" in current_mode:
-        # 🎯 狙擊型: 重視獲利回撤比 (Calmar)
-        if trades > 20: score -= (trades - 20) * 50
-        calmar = total_ret / (abs_mdd + 0.01)
-        score = calmar * 1000
-        
-    return score
-
-# ... (前段代碼不變)
-    
-    # [V28.0 修正] 計算進階績效指標
-    # 計算每日報酬率 (用於夏普值)
-    daily_rets = pd.Series(strategy_ret).fillna(0)
-    avg_daily_ret = daily_rets.mean()
-    std_daily_ret = daily_rets.std()
-    
-    # 年化夏普比率 (假設無風險利率為0)
-    sharpe_ratio = 0
-    if std_daily_ret != 0:
-        sharpe_ratio = (avg_daily_ret / std_daily_ret) * (252 ** 0.5)
-        
-    # 計算勝率
-    winning_trades = np.sum(trades[1:] > 0) # 簡易估算，實際需紀錄每筆損益
-    # 這裡用更精準的方式算勝率 (根據 pos 變化)
-    trade_pnl = []
-    curr_p = 0; entry_p = 0
-    for idx, p in enumerate(pos_list):
-        if curr_p == 0 and p == 1: entry_p = closes[idx]; curr_p = 1
-        elif curr_p == 1 and p == 0: 
-            pnl = (closes[idx] - entry_p) / entry_p
-            trade_pnl.append(pnl)
-            curr_p = 0
-            
-    win_rate = 0.0
-    if len(trade_pnl) > 0:
-        wins = sum(1 for x in trade_pnl if x > 0)
-        win_rate = wins / len(trade_pnl)
-
-    # 回傳增加 sharpe_ratio 和 win_rate
-    return pos_list, np.concatenate(([1.0], cum_ret)), total_ret, mdd, strat_names[strategy_mode], st_line, st_trends, entry_reasons, sharpe_ratio, win_rate
-
-# --- Page 1: AI 總司令選股 (V30.0 天網全域掃描版) ---
+# --- Page 1: AI 總司令選股 (V33.6 精簡優化版) ---
 def page_ai_selector():
-    st.header("🤖 AI 總司令：全自動選股戰情室 (V30.0)")
+    st.header("🤖 AI 總司令：V33.6 精簡優化版")
     
-    # 初始化 Session State
     if 'scan_results_df' not in st.session_state: st.session_state.scan_results_df = None
     if 'scan_top_stock' not in st.session_state: st.session_state.scan_top_stock = None
     if 'scan_json_report' not in st.session_state: st.session_state.scan_json_report = None
     
-    # [V30.0] 新增：掃描範圍選擇器
     c_mode, c_info = st.columns([1, 2])
     with c_mode:
         scan_scope = st.radio("📡 掃描雷達範圍", ["🎯 單一戰略板塊", "🌍 全球戰略 (全域掃描)"], horizontal=True)
@@ -816,20 +855,16 @@ def page_ai_selector():
     all_tickers = []
     selected_sector_name = "全域市場"
     
-    # --- 邏輯分支 ---
     if scan_scope == "🎯 單一戰略板塊":
-        # 原本的單一板塊邏輯
         selected_chain = st.selectbox("請選擇戰略板塊:", list(SECTOR_DB.keys()))
         selected_sector_name = selected_chain
         sub_sectors = SECTOR_DB[selected_chain]
         
-        # 收集該板塊股票
         with st.expander(f"📂 檢視 {selected_chain} 成分股", expanded=True):
             for sub_name, tickers in sub_sectors.items():
                 st.markdown(f"**📌 {sub_name}**")
                 sorted_tickers = sorted(tickers)
                 all_tickers.extend(sorted_tickers)
-                # 顯示標籤
                 html_tags = ""
                 for t in sorted_tickers:
                     display_name = STOCK_NAMES.get(t, t.replace(".TW", "").replace(".TWO", ""))
@@ -839,10 +874,7 @@ def page_ai_selector():
                 st.write("")
                 
     else:
-        # [V30.0] 全域掃描邏輯
         st.info("🌍 您已啟動「天網模式」，將掃描資料庫中 **所有板塊** 的股票。")
-        
-        # 收集所有股票 (去除重複)
         unique_tickers = set()
         total_sectors = 0
         for sector_name, sub_dict in SECTOR_DB.items():
@@ -852,19 +884,10 @@ def page_ai_selector():
                     unique_tickers.add(t)
         
         all_tickers = sorted(list(unique_tickers))
-        
-        # -------------------------------------------------------
-        # [修正點] 這裡原本少了 # 號導致報錯，現在修復了
-        # 統計各個板塊的數量 (用於核對資料一致性)
         sector_counts = {k: sum(len(v) for v in sub.values()) for k, sub in SECTOR_DB.items()}
-        # -------------------------------------------------------
         
         with c_info:
-            # [V31.3] 增加詳細核對資訊
             st.metric("掃描目標總數", f"{len(all_tickers)} 檔", f"涵蓋 {total_sectors} 大板塊")
-            
-            # 顯示前幾個板塊的數量，方便您核對 (只顯示前 3 個板塊當代表)
-            # 這裡會把剛剛算出來的 sector_counts 轉成字串顯示
             check_str = " | ".join([f"{k}:{v}" for k,v in list(sector_counts.items())[:3]])
             st.caption(f"🛡️ 資料一致性核對: {check_str} ...")
             
@@ -873,49 +896,57 @@ def page_ai_selector():
 
     st.markdown("---")
     
-    # 啟動掃描按鈕
     btn_label = f"🚀 啟動{scan_scope}"
     if st.button(btn_label, type="primary"):
         if not all_tickers:
             st.error("❌ 掃描清單為空，請檢查 sector_db.json")
         else:
             results = []
+            failed_tickers = [] 
+            
             progress_bar = st.progress(0); status_text = st.empty(); 
-            status_text.text(f"⚡ AI 部隊集結中，目標 {len(all_tickers)} 檔，正在平行掃描...")
+            status_text.text(f"⚡ V33.6 智慧引擎啟動，目標 {len(all_tickers)} 檔...")
             
             start_time = time.time()
             
-            # 使用執行緒池 (雲端建議 max_workers 不要超過 5，避免記憶體爆掉)
-            # 如果是在本機跑，可以改回 10 或 20
-            # 使用執行緒池
-            # [V31.5 建議] 雲端為了抗阻擋，降速求穩
-            # 本機可以用 10，雲端建議改為 3 或 4
-            workers = 4 
+            workers = 6 
             with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = list(executor.map(process_stock_task, all_tickers))
+                future_to_ticker = {executor.submit(process_stock_task, t): t for t in all_tickers}
                 
-            for i, res in enumerate(futures):
-                if res: results.append(res)
-                progress_bar.progress((i + 1) / len(all_tickers))
+                completed_count = 0
+                total_count = len(all_tickers)
                 
+                for future in as_completed(future_to_ticker):
+                    ticker = future_to_ticker[future]
+                    try:
+                        res = future.result()
+                        if res and res.get("status") == "ok":
+                            results.append(res)
+                        else:
+                            failed_tickers.append(ticker)
+                    except Exception as exc:
+                        failed_tickers.append(ticker)
+                    
+                    completed_count += 1
+                    pct = completed_count / total_count
+                    progress_bar.progress(pct)
+                    
+                    if completed_count % 10 == 0:
+                         elapsed = time.time() - start_time
+                         avg_time = elapsed / completed_count
+                         remain = (total_count - completed_count) * avg_time
+                         status_text.text(f"⚡ 掃描中: {completed_count}/{total_count} | 成功: {len(results)} | 預估剩餘: {int(remain)} 秒")
+
+            progress_bar.progress(100)
             end_time = time.time(); duration = end_time - start_time
             
             if results:
-                # 處理結果
                 res_df = pd.DataFrame(results).sort_values("總分", ascending=False)
-                top_stock = res_df.iloc[0] # 找出全體總冠軍
+                top_stock = res_df.iloc[0] 
                 
-                # [V31.4 新增] 資料品質健檢儀表板
-                # 1. 計算成功率：實際抓到的數量 / 預計掃描的數量
                 success_rate = len(res_df) / len(all_tickers)
                 
-                # 2. 檢查資料新鮮度：抓取冠軍股的最後一筆交易日期
-                # 我們需要重新叫一次 get_stock_data 來確認日期，或者在 process_stock_task 回傳時就包含日期
-                # 這裡用一個快速的方式：檢查 res_df 是否有包含日期欄位 (若之前沒存，這裡無法顯示，但可作為改善方向)
-                # 替代方案：我們直接在畫面上顯示「本次掃描樣本數」
-                
                 with c_info:
-                    # 覆蓋原本的 metric，顯示更詳細的品質數據
                     st.metric(
                         "掃描品質報告", 
                         f"{len(res_df)} / {len(all_tickers)} 檔",
@@ -923,16 +954,18 @@ def page_ai_selector():
                     )
                     
                     if success_rate < 0.95:
-                        st.warning(f"⚠️ 警告：有 {len(all_tickers) - len(res_df)} 檔股票抓取失敗 (可能是雲端 IP 被擋)，結果可能失準。")
+                        st.warning(f"⚠️ 有 {len(failed_tickers)} 檔掃描失敗 (可能是連線阻擋或下市)。")
+                        with st.expander("❌ 檢視失敗名單"):
+                            st.write(", ".join(failed_tickers))
                     else:
-                        st.caption("✅ 資料完整度良好 (Loss < 5%)")
+                        st.caption("✅ 資料完整度良好")
 
-
-                # 生成 JSON 報告
                 scan_results_list = res_df.to_dict('records')
                 json_report = generate_battle_report(top_stock, scan_results_list)
                 
-                # 存入 Session State
+                db_manager.save_scan_report(scan_scope, top_stock['代號'], top_stock['總分'], json_report)
+                st.toast("✅ 掃描結果已自動備份至資料庫！", icon="💾")
+                
                 st.session_state.scan_results_df = res_df
                 st.session_state.scan_top_stock = top_stock
                 st.session_state.scan_json_report = json_report
@@ -941,84 +974,65 @@ def page_ai_selector():
             else:
                 st.warning("無有效資料或連線失敗。")
             
-    # --- 顯示結果與 Email 發送 (共用邏輯) ---
-    # [修正重點] 下面這一行是第 943 行左右，注意看冒號 :
     if st.session_state.scan_results_df is not None:
-        
-        # [修正重點] 這裡必須縮排 (4個空白)，Python 才知道這些程式碼屬於上面的 if
         res_df = st.session_state.scan_results_df
         top_stock = st.session_state.scan_top_stock
         json_report = st.session_state.scan_json_report
         
-        # 標題區分
         if scan_scope == "🎯 單一戰略板塊":
             st.success(f"🏆 【{selected_sector_name}】板塊冠軍：**{top_stock['名稱']}** 總分：{top_stock['總分']}")
         else:
             st.success(f"👑 **【全市場總冠軍】**：**{top_stock['名稱']} ({top_stock['代號']})** 總分：{top_stock['總分']}")
         
-        # 顯示結果表格 (這一行原本報錯，現在縮排正確了)
         st.dataframe(res_df.head(50).style.background_gradient(subset=['總分'], cmap='RdYlGn'), use_container_width=True)
         st.caption(f"💡 僅顯示前 50 名 (共 {len(res_df)} 筆結果)")
 
-        # ================= [V32.0 新增] 全市場熱力圖 (Market Treemap) =================
         st.markdown("---")
         with st.expander("🗺️ V32.0 戰略地圖：全市場資金流向熱力圖", expanded=True):
             if '板塊' not in res_df.columns:
-                # 1. 建立反向索引 (Ticker -> Sector)
                 ticker_to_sector = {}
                 for main_sec, sub_dict in SECTOR_DB.items():
                     for sub_sec, t_list in sub_dict.items():
                         for t in t_list:
                             clean_t = t.replace(".TW", "").replace(".TWO", "")
-                            # 格式: 主板塊 > 子板塊
                             ticker_to_sector[clean_t] = {"Main": main_sec, "Sub": sub_sec}
                 
-                # 2. 將板塊資訊 Map 回 res_df
-                # 使用 apply 搭配 lambda 來查表
-                def get_sector_info(row, key):
+                def get_sector_info_row(row, key):
                     code = row['代號'].replace(".TW", "").replace(".TWO", "")
                     return ticker_to_sector.get(code, {}).get(key, "其他")
 
-                # 為了不影響原始 df，建立一個繪圖專用 df
                 plot_df = res_df.copy()
-                plot_df['主板塊'] = plot_df.apply(lambda x: get_sector_info(x, "Main"), axis=1)
-                plot_df['子板塊'] = plot_df.apply(lambda x: get_sector_info(x, "Sub"), axis=1)
-                # 權重放大
+                plot_df['主板塊'] = plot_df.apply(lambda x: get_sector_info_row(x, "Main"), axis=1)
+                plot_df['子板塊'] = plot_df.apply(lambda x: get_sector_info_row(x, "Sub"), axis=1)
                 plot_df['權重'] = plot_df['總分'] ** 2 
                 
-                # 3. 繪製 Treemap
                 import plotly.express as px
                 
-                # 定義顏色：分數越高越紅
                 fig_tree = px.treemap(
                     plot_df, 
                     path=[px.Constant("台股全市場"), '主板塊', '子板塊', '名稱'], 
                     values='權重',
                     color='總分',
-                    color_continuous_scale='RdYlGn_r', # 紅到綠
+                    color_continuous_scale='RdYlGn_r', 
                     title=f"AI 戰力熱力圖 (總掃描: {len(plot_df)} 檔)"
                 )
                 fig_tree.update_traces(root_color="lightgrey")
                 fig_tree.update_layout(margin=dict(t=30, l=10, r=10, b=10), height=500)
                 
                 st.plotly_chart(fig_tree, use_container_width=True)
-        # =========================================================================
 
         target_code = top_stock['代號'].replace(".TW", "").replace(".TWO", "")
         st.info(f"建議將總冠軍 **{target_code}** 帶入 PyGAD 進行演化。")
         
-        # ================= [V31.1] Email 發送區塊 =================
         st.markdown("---")
         
-        # 準備 Email 標題
         if scan_scope == "🎯 單一戰略板塊":
             title_prefix = f"【{selected_sector_name}冠軍】"
         else:
             title_prefix = "【全域總冠軍】" if len(res_df) > 50 else "【掃描冠軍】"
             
-        email_subject = f"AI戰報(V32)：{title_prefix} {top_stock['名稱']}({target_code}) 分析報告"
+        email_subject = f"AI戰報(V33)：{title_prefix} {top_stock['名稱']}({target_code}) 分析報告"
         
-        # 生成 Top 10 HTML
         top_10_html = ""
         limit = min(10, len(res_df))
         for i in range(limit):
@@ -1030,13 +1044,12 @@ def page_ai_selector():
             elif i == 2: icon = "🥉"
             top_10_html += f"<li>{icon} <b>{row['名稱']}</b> ({row['代號']}) - 總分: {row['總分']} | 現價: {price_val:.1f}</li>"
 
-        # 組合 HTML
         email_html = f"""
         <html>
         <body style="font-family: Arial, sans-serif;">
-            <h2 style="color: #00adb5;">🤖 AI 戰情室 V32 每日晨報</h2>
+            <h2 style="color: #00adb5;">🤖 AI 戰情室 V33 每日晨報</h2>
             <hr>
-            <p>早安！AI 系統已完成 V32 天眼掃描，今日決選結果如下：</p>
+            <p>早安！AI 系統已完成 V33 天眼掃描，今日決選結果如下：</p>
             <table style="width: 100%; border-collapse: collapse;">
                 <tr style="background-color: #f2f2f2;">
                     <td style="padding: 10px; border: 1px solid #ddd;"><b>👑 總冠軍</b></td>
@@ -1051,7 +1064,7 @@ def page_ai_selector():
             <p><b>📊 今日強勢股 Top 10：</b></p>
             <ul style="line-height: 1.6;">{top_10_html}</ul>
             <br>
-            <p style="color: gray; font-size: 0.8em;">本信件由 AI 戰情室 V32 自動發送。</p>
+            <p style="color: gray; font-size: 0.8em;">本信件由 AI 戰情室 V33 自動發送。</p>
         </body>
         </html>
         """
@@ -1069,7 +1082,6 @@ def page_ai_selector():
                     st.success(status_msg)
                 else:
                     st.error(status_msg)
-        # ============================================================
         
         st.markdown("---")
         with st.expander("📋 每日戰情通報 (JSON For App)", expanded=True):
@@ -1083,18 +1095,30 @@ def page_ai_selector():
         with c3: st.markdown("#### 🚀 M - 動能"); st.write("月漲>0%(+5), 月漲>5%(+5)")
         with c4: st.markdown("#### 🏢 F - 基本"); st.write("基礎分(+5), PE<25(+2), PB<4(+2)")
 
-# --- Page 2: 全能達人戰情室 (V32.0 Gemini 整合版) ---
+# --- Page 2: 全能達人戰情室 (V33.6 精簡優化版) ---
+# [V33.6 修改] 戰情室：解決切換模組失憶問題
 def page_dashboard():
-    # --- 除錯用 (測試完請刪除) ---
-    st.write("目前 Secrets 裡有的鑰匙:", list(st.secrets.keys()))
-    # ---------------------------
-    st.header("⚡ 全能達人戰情室 (V32.0)")
+    st.header("⚡ 全能達人戰情室 (V33.6 精簡優化)")
+
+    # 1. Session State 初始化 (記憶體)
+    if 'dash_current_stock' not in st.session_state:
+        st.session_state.dash_current_stock = "2330"
+    if 'dash_chat_history' not in st.session_state:
+        st.session_state.dash_chat_history = [] # 儲存對話
+
     col_input, col_info = st.columns([1, 3])
     with col_input: 
-        t = st.text_input("輸入個股代號", "2330", key="dash_t")
+        # 綁定 Session State
+        t_input = st.text_input("輸入個股代號", value=st.session_state.dash_current_stock, key="dash_input")
+        if t_input != st.session_state.dash_current_stock:
+            st.session_state.dash_current_stock = t_input
+            # 換股時清空對話，或者保留(視需求而定，這裡選擇換股清空對話以避免混淆)
+            st.session_state.dash_chat_history = [] 
+            st.rerun() # 強制刷新
     
+    t = st.session_state.dash_current_stock # 使用記憶中的代碼
+
     if t:
-        # 1. 抓取資料
         df = get_stock_data(t)
         if df.empty or len(df) < 30: 
             st.error("無資料或資料不足")
@@ -1102,35 +1126,48 @@ def page_dashboard():
         
         df = calculate_indicators(df)
         info = get_stock_info(t)
-        # 嘗試取得名稱，若無則用代號
         name = STOCK_NAMES.get(t.upper() + ".TW", t)
         if name == t: name = STOCK_NAMES.get(t, t)
         
-        last = df.iloc[-1]; prev = df.iloc[-2]
-        change = last['Close'] - prev['Close']; pct = change / prev['Close']
+        live_price, live_time = get_realtime_quote(t)
+        
+        if live_price:
+            last_price = live_price
+            prev_close = df.iloc[-1]['Close'] 
+            if df.index[-1].date() == datetime.now().date():
+                prev_close = df.iloc[-2]['Close']
+            
+            change = last_price - prev_close
+            pct = change / prev_close
+            time_str = live_time.strftime("%H:%M")
+        else:
+            last_price = df.iloc[-1]['Close']
+            prev_close = df.iloc[-2]['Close']
+            change = last_price - prev_close
+            pct = change / prev_close
+            time_str = df.index[-1].strftime("%Y-%m-%d")
+
         color = "red" if change > 0 else "green"
         
         with col_info: 
             st.markdown(f"### {name} ({t})")
-            st.markdown(f"<h2 style='color:{color}'>{last['Close']:.2f} <small>({change:+.2f} / {pct:+.2%})</small></h2>", unsafe_allow_html=True)
+            st.markdown(f"<h2 style='color:{color}'>{last_price:.2f} <small>({change:+.2f} / {pct:+.2%}) <span style='font-size:0.5em;color:gray'>@{time_str}</span></small></h2>", unsafe_allow_html=True)
             sectors = get_sector_info(t.upper() + ".TW") 
             for s in sectors: st.caption(f"📍 {s}")
             
         tab1, tab2, tab3 = st.tabs(["ℹ️ 資訊流 & AI", "💸 資金流", "📈 技術流"])
         
-        # --- Tab 1: 資訊流 (含 V32.0 Gemini) ---
+        last_daily = df.iloc[-1] 
+
+        # --- Tab 1: 資訊流 & RAG ---
         with tab1:
             c1, c2 = st.columns([1, 1])
             with c1:
                 st.subheader("📰 特種搜查")
-                # 呼叫新聞函數 (相容舊版名稱，若您有改名請自行調整)
                 try:
                     news, keywords = get_special_news_v28(t, name)
-                except:
-                    # 相容性備案
-                    news = get_special_news(t, name); keywords = []
+                except: news = []; keywords = []
                 
-                # 顯示關鍵字
                 if keywords:
                     st.markdown("🔥 **AI 提取關鍵字:**")
                     kw_html = "".join([f"<span style='background:#333;color:#00adb5;padding:2px 6px;border-radius:4px;margin:2px;font-size:0.8em'>{k}</span>" for k in keywords])
@@ -1138,84 +1175,85 @@ def page_dashboard():
                 
                 st.divider()
 
-# ================= [V32.4] Gemini 分析師 (穩定額度版) =================
-                if "AI_Studio_Key" in st.secrets:
-                    if st.button("🤖 呼叫 Gemini 頂級分析師", type="primary"):
-                        with st.spinner("Gemini 正在閱讀財報與新聞..."):
-                            try:
-                                # 設定 Key
-                                genai.configure(api_key=st.secrets["AI_Studio_Key"])
-                                
-                                # [修正點] 改用 'gemini-flash-latest'
-                                # 這會自動指向目前有免費額度的最新版本 (通常是 1.5 Flash)
-                                model = genai.GenerativeModel('gemini-flash-latest')
-                                
-                                # 準備資料
-                                last_close = df.iloc[-1]['Close']
-                                ma60 = df.iloc[-1]['MA60']
-                                trend = "多頭排列" if last_close > ma60 else "空頭/盤整"
-                                news_titles = ", ".join([n['title'] for n in news[:5]]) if news else "無近期新聞"
-                                
-                                prompt = (
-                                    f"你是一位華爾街頂級分析師。請分析台股 {name}({t})。\n"
-                                    f"1. 技術面：現價 {last_close}，MA60為 {ma60:.2f}，目前呈現 {trend}。\n"
-                                    f"2. 消息面：近期新聞標題包含「{news_titles}」。\n"
-                                    f"3. 任務：請用繁體中文，綜合上述資訊，給出約 100 字的精簡點評，並指出潛在風險與機會。"
-                                )
-                                
-                                response = model.generate_content(prompt)
-                                st.success("🤖 Gemini 分析報告：")
-                                st.markdown(f"> {response.text}")
-                                
-                            except Exception as e:
-                                # 錯誤處理優化：如果還是 429，顯示更友善的訊息
-                                if "429" in str(e):
-                                    st.warning("⚠️ AI 分析師正在忙線中 (達到免費額度上限)，請稍等 1 分鐘後再試。")
-                                else:
-                                    st.error(f"Gemini 連線失敗: {e}")
-                else:
-                    st.caption("⚠️ 請在 Secrets 設定 AI_Studio_Key 以啟用 AI 分析")
-                st.divider()
-                # ===========================================================
+                st.subheader("🤖 RAG 財經智囊團")
+                # 初始化 Agent
+                if 'rag_agent' not in st.session_state:
+                    if "AI_Studio_Key" in st.secrets:
+                        st.session_state.rag_agent = RAGAdvisor(st.secrets["AI_Studio_Key"])
+                    else: st.warning("請先設定 API Key")
+                
+                agent = st.session_state.get('rag_agent')
 
+                if agent:
+                    if st.button("📥 載入個股大腦 (News + Tech)", key="rag_load", type="secondary"):
+                        with st.spinner("AI 正在閱讀財報與線圖..."):
+                            agent.clear_memory()
+                            ma_state = "多頭排列" if last_daily['Close'] > last_daily['MA60'] else "空頭/盤整"
+                            tech_summary = (
+                                f"【技術面數據】{name}({t}) 收盤價 {last_daily['Close']}。MA20={last_daily['MA20']:.2f}, MA60={last_daily['MA60']:.2f}。 "
+                                f"目前趨勢為{ma_state}。RSI={last_daily['RSI']:.2f}。KD值(K/D)=({last_daily['K']:.1f}/{last_daily['D']:.1f})。 "
+                                f"MACD柱狀體={last_daily['Hist']:.2f}。"
+                            )
+                            agent.add_document(tech_summary, source="Technical")
+                            for n in news[:8]: 
+                                agent.add_document(f"{n['title']} (日期:{n['pubDate']})", source="News")
+                            if info:
+                                fund_sum = info.get('longBusinessSummary', '無詳細簡介')
+                                agent.add_document(f"【公司簡介】{fund_sum[:300]}", source="Fundamental")
+                            st.success(f"✅ 大腦已載入！")
+
+                    # 顯示歷史對話 (解決消失問題)
+                    for msg in st.session_state.dash_chat_history:
+                        with st.chat_message(msg["role"]):
+                            st.write(msg["content"])
+
+                    user_q = st.chat_input("請輸入問題...", key="chat_input_w")
+                    if user_q:
+                        # 1. 顯示使用者問題
+                        st.session_state.dash_chat_history.append({"role": "user", "content": user_q})
+                        with st.chat_message("user"):
+                            st.write(user_q)
+                        
+                        # 2. AI 回答
+                        if not agent.memory_docs:
+                            st.warning("請先點擊上方按鈕載入資料！")
+                        else:
+                            with st.spinner("AI 思考中..."):
+                                ans = agent.query(user_q)
+                                st.session_state.dash_chat_history.append({"role": "assistant", "content": ans})
+                                with st.chat_message("assistant"):
+                                    st.markdown(ans)
+                else:
+                    st.caption("⚠️ RAG 未啟用")
+                
+                st.divider()
                 if news: 
                     for n in news: 
                         st.markdown(f'<div class="news-card"><a href="{n["link"]}" target="_blank" class="news-title"><span class="sentiment-tag {n.get("sent_color", "sent-neu")}">{n.get("sent_label", "中性")}</span> {n["title"]}</a><span class="news-source">{n["publisher"]}</span> <span class="news-time">{n["pubDate"]}</span></div>', unsafe_allow_html=True)
-                else: 
-                    st.info("無新聞")
-                    st.markdown(f'<a href="https://www.google.com/search?q={t}+tw+stock+news&tbm=nws" target="_blank" class="link-btn">🔍 Google</a>', unsafe_allow_html=True)
+                else: st.info("無新聞")
             
             with c2: 
-                # 板塊雷達 (V28 功能)
                 st.subheader("🔗 板塊聯動雷達")
                 try:
                     sec_data = analyze_sector_linkage(t)
                     if sec_data:
                         st.caption(f"所屬子板塊: **{sec_data['sector']}**")
-                        if sec_data['correlations']:
-                            corr_cols = st.columns(len(sec_data['correlations']))
-                            for i, (p_name, corr_val) in enumerate(sec_data['correlations'].items()):
-                                with corr_cols[i % 4]:
-                                    st.metric(f"vs {p_name}", f"{corr_val:.2f}")
-                        
                         norm_df = sec_data['normalized']
                         fig_sec = go.Figure()
                         fig_sec.add_trace(go.Scatter(x=norm_df.index, y=norm_df['Main'], name=name, line=dict(color='yellow', width=2)))
                         fig_sec.add_trace(go.Scatter(x=norm_df.index, y=sec_data['avg_trend'], name="同業平均", line=dict(color='gray', dash='dash')))
                         fig_sec.update_layout(height=300, margin=dict(l=0,r=0,t=10,b=0), template="plotly_dark", hovermode="x unified")
                         st.plotly_chart(fig_sec, use_container_width=True)
-                    else:
-                        st.warning("無法取得同業資料")
-                except:
-                    st.warning("板塊資料載入失敗")
+                    else: st.warning("無法取得同業資料")
+                except: st.warning("板塊資料載入失敗")
 
                 st.subheader("🏢 簡介")
                 s = info.get('longBusinessSummary')
                 st.write(s) if s else st.warning("無簡介")
                 st.markdown(f'<a href="https://goodinfo.tw/tw/StockDetail.asp?STOCK_ID={t}" target="_blank" class="link-btn">Goodinfo</a>', unsafe_allow_html=True)
                 
-        # --- Tab 2: 資金流 ---
         with tab2:
+            # (維持原樣)
             st.markdown("### 🏛️ 官方籌碼"); c_l = st.columns(3)
             with c_l[0]: st.markdown(f'<a href="https://goodinfo.tw/tw/ShowBuySaleChart.asp?STOCK_ID={t}&CHT_CAT=DATE" target="_blank" class="link-btn">Goodinfo</a>', unsafe_allow_html=True)
             with c_l[1]: st.markdown(f'<a href="https://www.tpex.org.tw/zh-tw/mainboard/trading/major-institutional/detail/day.html" target="_blank" class="link-btn">TPEx</a>', unsafe_allow_html=True)
@@ -1225,7 +1263,7 @@ def page_dashboard():
             m1, m2 = st.columns(2)
             obv_s = df['OBV'].iloc[-1] - df['OBV'].iloc[-20]
             m1.metric("OBV", "吸籌 🟢" if obv_s > 0 else "出貨 🔴")
-            vr = last['Volume']/last['VolMA20'] if last['VolMA20']>0 else 0
+            vr = last_daily['Volume']/last_daily['VolMA20'] if last_daily['VolMA20']>0 else 0
             m2.metric("量能", f"{vr:.2f}x")
             
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
@@ -1235,13 +1273,13 @@ def page_dashboard():
             fig.update_layout(height=600, template="plotly_dark", xaxis_rangeslider_visible=False)
             st.plotly_chart(fig, use_container_width=True, key="fund")
             
-        # --- Tab 3: 技術流 ---
         with tab3:
+            # (維持原樣)
             st.write("📊 **進階技術 (含圖形識別)**")
             c1,c2,c3 = st.columns(3)
-            c1.metric("ADX", f"{last.get('ADX',0):.1f}")
-            c2.metric("KD", f"K={last['K']:.1f}")
-            c3.metric("BW", f"{last.get('BandWidth',0):.2%}")
+            c1.metric("ADX", f"{last_daily.get('ADX',0):.1f}")
+            c2.metric("KD", f"K={last_daily['K']:.1f}")
+            c3.metric("BW", f"{last_daily.get('BandWidth',0):.2%}")
             
             fig = make_subplots(rows=3, cols=1, shared_xaxes=True, row_heights=[0.5, 0.25, 0.25])
             fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='K線'), row=1, col=1)
@@ -1255,28 +1293,69 @@ def page_dashboard():
             fig.add_trace(go.Scatter(x=df.index, y=df['K'], line=dict(color='yellow')), row=2, col=1)
             fig.add_trace(go.Scatter(x=df.index, y=df['D'], line=dict(color='purple')), row=2, col=1)
             fig.add_trace(go.Scatter(x=df.index, y=df['ADX'], line=dict(color='white')), row=3, col=1)
+            # --- 新增功能：AI 自動繪製斐波那契回撤 (Fibonacci) ---
+            # 1. 抓取這段期間的最高與最低點
+            period_high = df['High'].max()
+            period_low = df['Low'].min()
+            diff = period_high - period_low
+            
+            # 2. 定義黃金分割位
+            fib_levels = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1]
+            colors = ['gray', 'red', 'orange', 'yellow', 'lime', 'cyan', 'gray']
+            
+            # 3. 畫線到 K 線圖上 (fig 的 row=1)
+            # 判斷趨勢：如果現在價格比較靠近高點，可能是上漲趨勢的回調；反之亦然。
+            # 這裡簡單畫出區間的靜態線
+            for i, level in enumerate(fib_levels):
+                price_level = period_high - (diff * level)
+                fig.add_shape(
+                    type="line",
+                    x0=df.index[0], y0=price_level, x1=df.index[-1], y1=price_level,
+                    line=dict(color=colors[i], width=1, dash="dot"),
+                    row=1, col=1
+                )
+                # 加上文字標籤 (顯示 0.618 這種數字)
+                fig.add_annotation(
+                    x=df.index[-5], y=price_level,
+                    text=f"{level:.3f} ({price_level:.1f})",
+                    showarrow=False,
+                    font=dict(color=colors[i], size=10),
+                    xanchor="left",
+                    row=1, col=1
+                )
+            
+            # 更新標題
+            fig.update_layout(title_text=f"{name} 技術分析 (含自動黃金分割)")
+                    
+
             fig.update_layout(height=700, template="plotly_dark", xaxis_rangeslider_visible=False)
+            
+            
+
             st.plotly_chart(fig, use_container_width=True, key="tech")
+
+# [V33.6 修改] 策略進化：新增「當日策略訊號 (Inference)」
 def page_ga():
-    st.header("🧬 PyGAD 策略進化 (V28.2 儀表板修復版)")
+    st.header("🧬 PyGAD 策略進化 (V33.6 精簡優化版)")
     if not HAS_PYGAD: st.error("❌ 需安裝 pygad"); return
     
-    # [V28.2 修改] 增加即時名稱顯示
+    if 'saved_ga_target' not in st.session_state:
+        st.session_state.saved_ga_target = "2330"
+    if 'saved_ga_cash' not in st.session_state:
+        st.session_state.saved_ga_cash = 1000000
+
     c1, c2 = st.columns([1, 2])
     with c1: 
-        t = st.text_input("優化標的", "2330", key="ga_t")
+        t = st.text_input("優化標的", value=st.session_state.saved_ga_target)
+        st.session_state.saved_ga_target = t
         
-        # 自動查找名稱邏輯
         stock_name = "未知 / 未載入"
-        # 嘗試直接查找或加 .TW 查找
         if t in STOCK_NAMES: stock_name = STOCK_NAMES[t]
         elif f"{t}.TW" in STOCK_NAMES: stock_name = STOCK_NAMES[f"{t}.TW"]
-        elif f"{t}.TWO" in STOCK_NAMES: stock_name = STOCK_NAMES[f"{t}.TWO"]
-        
-        # 使用 caption 顯示在輸入框正下方
         st.caption(f"📌 **{stock_name}**")
         
-        cash = st.number_input("本金", value=1000000)
+        cash = st.number_input("本金", value=st.session_state.saved_ga_cash)
+        st.session_state.saved_ga_cash = cash
 
     with c2: 
         c2a, c2b = st.columns(2)
@@ -1291,7 +1370,6 @@ def page_ga():
         if 'ga_results' in st.session_state: del st.session_state.ga_results
         modes = ["🛡️ 保守型", "⚔️ 激進型", "🎯 狙擊型"]; results_store = {}
         
-        # 1. 數據準備
         df = get_stock_data(t, period=period); 
         if df.empty: st.error("無資料"); return
         df = calculate_indicators(df).dropna()
@@ -1301,6 +1379,7 @@ def page_ga():
         split_idx = int(len(df) * split_pct); train_df = df.iloc[:split_idx]; test_df = df.iloc[split_idx:]; 
         st.session_state.train_df = train_df; split_date = df.index[split_idx]
         
+        # 準備訓練數據字典
         data_dict = {
             'open': train_df['Open'].values, 'high': train_df['High'].values, 'low': train_df['Low'].values, 'close': train_df['Close'].values,
             'volume': train_df['Volume'].values, 'vol_ma': train_df['VolMA20'].fillna(0).values,
@@ -1315,14 +1394,13 @@ def page_ga():
         gene_space = [range(0, 4), range(5, 41), range(10, 61), range(15, 51), range(10, 51), range(10, 101), range(5, 21), range(0, 11), range(1, 11)]
         progress_bar = st.progress(0)
         
-        # 2. 演化迴圈
         for i, m in enumerate(modes):
             st.session_state.current_running_mode = m 
             with st.spinner(f"正在演化 【{m}】..."):
                 ga = pygad.GA(num_generations=gens, num_parents_mating=5, fitness_func=fitness_func, sol_per_pop=pop_size, num_genes=9, gene_space=gene_space, random_seed=42, suppress_warnings=True)
                 ga.run(); best_sol, _, _ = ga.best_solution()
                 
-                # 全期間回測
+                # 使用完整數據進行回測以取得最新訊號
                 full_data_dict = {
                     'open': df['Open'].values, 'high': df['High'].values, 'low': df['Low'].values, 'close': df['Close'].values,
                     'volume': df['Volume'].values, 'vol_ma': df['VolMA20'].fillna(0).values,
@@ -1340,8 +1418,7 @@ def page_ga():
                 res_tuple = run_strategy_multi(full_data_dict, strat_type, p1, p2, p3, sl_atr, tp_atr, vol_factor, trend_filter_mode, risk)
                 
                 if res_tuple:
-                    # [修改這裡] 這裡也要改成接收 10 個變數 (使用 _ 忽略最後兩個不需要畫圖的變數)
-                    pos, cum_ret, total_ret, mdd, strat_name, st_line, trends, entry_reasons, _, _ = res_tuple
+                    pos, cum_ret, total_ret, mdd, strat_name, st_line, trends, entry_reasons, sharpe, win_rate = res_tuple
                     
                     results_store[m] = {
                         "params": (strat_type, p1, p2, p3, sl_atr, tp_atr, vol_factor, trend_filter_mode, risk), 
@@ -1351,23 +1428,21 @@ def page_ga():
                         "st_line": pd.Series(st_line, index=df.index), 
                         "trend": pd.Series(trends, index=df.index), 
                         "total_ret": total_ret, "df": df, "split_date": split_date, "strat_name": strat_name,
-                        "entry_reasons": pd.Series(entry_reasons, index=df.index)
+                        "entry_reasons": pd.Series(entry_reasons, index=df.index),
+                        "sharpe": sharpe 
                     }
             progress_bar.progress((i + 1) / 3)
         st.session_state.ga_results = results_store; progress_bar.empty(); st.success("🏆 全方位戰略演化完成！")
 
-    # 3. 顯示結果
     if 'ga_results' in st.session_state:
         results_store = st.session_state.ga_results; modes = list(results_store.keys())
         
-        # 統計表
         summary_data = []
         for m in modes:
             res = results_store[m]; df_res = res['df']; cum_ret = res['cum_ret']; pos = res['pos']; strat_name = res['strat_name']
             split_date = res['split_date']
             train_mask = df_res.index < split_date; test_mask = df_res.index >= split_date
             
-            # [V27.11] 補回 MDD 計算
             t_ret = 0; t_trades = 0; t_pnl = 0; t_mdd = 0.0
             if len(cum_ret[train_mask]) > 0:
                 curve = cum_ret[train_mask] / cum_ret[train_mask].iloc[0]
@@ -1391,59 +1466,68 @@ def page_ga():
             })
         st.dataframe(pd.DataFrame(summary_data))
         
-        if st.button("📱 生成 App 通報資料 (JSON)"):
-            best_mode = modes[0]; best_res = results_store[best_mode]
-            report = generate_app_report(t, df, best_res)
-            st.json(report)
-
-        # 4. 繪圖與儀表板區
         tabs = st.tabs(modes)
         for idx, tab in enumerate(tabs):
             m = modes[idx]; res = results_store[m]; df = res['df']; strat_name = res['strat_name']
             reasons = res['entry_reasons']; pos = res['pos']
-            params = res['params'] # 取得參數
+            params = res['params'] 
+            sharpe = res.get('sharpe', 0)
             
             with tab:
-                # [V27.11] 戰情儀表板與參數顯示
+                # [新增] 策略訊號推論 (Inference)
                 last_pos = pos.iloc[-1]
+                prev_pos = pos.iloc[-2]
                 last_close = df['Close'].iloc[-1]
                 last_atr = df['ATR'].iloc[-1]
-                
-                # 計算操作數值
                 strat_t, p1, p2, p3, sl_atr, tp_atr, vol_f, t_filt, _ = params
                 
-                # 目標價與停損價估算 (僅供參考)
                 target_price = last_close + (last_atr * tp_atr)
                 stop_price = last_close - (last_atr * sl_atr)
                 
-                # 狀態判斷
-                status_color = "green" if last_pos == 1 else "gray"
-                status_text = "🟢 持有中 (BULL)" if last_pos == 1 else "⚪ 空手觀望 (WAIT)"
+                # 訊號判讀
+                sig_text = "⚪ 空手觀望 (WAIT)"
+                sig_color = "gray"
+                bg_color = "#f0f2f6"
                 
-                # 顯示儀表板
+                if last_pos == 1 and prev_pos == 0:
+                    sig_text = "🔴 今日買進訊號 (BUY SIGNAL)"
+                    sig_color = "#d9534f"
+                    bg_color = "#f9dede"
+                elif last_pos == 1:
+                    sig_text = "🟢 持有續抱 (HOLD)"
+                    sig_color = "#28a745"
+                    bg_color = "#dff0d8"
+                elif last_pos == 0 and prev_pos == 1:
+                    sig_text = "🟢 今日賣出訊號 (SELL SIGNAL)"
+                    sig_color = "#28a745"
+                    bg_color = "#dff0d8"
+
                 st.markdown(f"""
-                <div style="background-color: #f0f2f6; padding: 15px; border-radius: 10px; border-left: 5px solid {status_color};">
-                    <h3 style="margin:0; color: {status_color};">{status_text}</h3>
-                    <p style="margin:5px 0 0 0;">
-                    <b>現價:</b> {last_close:.2f} | 
-                    <b>🎯 目標:</b> {target_price:.2f} | 
-                    <b>🛡️ 停損:</b> {stop_price:.2f} (ATR={last_atr:.2f})
+                <div style="background-color: {bg_color}; padding: 20px; border-radius: 10px; border-left: 8px solid {sig_color}; text-align: center;">
+                    <h2 style="margin:0; color: {sig_color};">{sig_text}</h2>
+                    <hr style="border-color: #ddd;">
+                    <p style="font-size: 1.1em; font-weight: bold; color: #333;">
+                    當前價格: {last_close:.2f} | 🎯 潛在目標: {target_price:.2f} | 🛡️ 建議停損: {stop_price:.2f}
                     </p>
+                    <p style="color: gray; font-size: 0.9em;">(基於 {strat_name} 策略, ATR={last_atr:.2f})</p>
                 </div>
                 """, unsafe_allow_html=True)
                 
-                # 顯示系統參數 (Best Genes)
-                with st.expander("🧬 檢視 AI 演化之最佳系統參數", expanded=False):
+                with st.expander("🧬 檢視 AI 演化之最佳系統參數 & 儲存", expanded=False):
                     st.write(f"**策略類型**: {strat_name} (Type {strat_t})")
                     st.write(f"**核心參數**: P1={p1}, P2={p2}, P3={p3}")
                     st.write(f"**風控參數**: 停損={sl_atr:.1f}x ATR, 停利={tp_atr:.1f}x ATR")
                     st.write(f"**濾網設定**: 量能係數={vol_f:.1f}, 趨勢濾網={'開啟' if t_filt else '關閉'}")
+                    
+                    c_save_1, c_save_2 = st.columns([3, 1])
+                    note = c_save_1.text_input("📝 備註 (選填)", key=f"note_{idx}")
+                    if c_save_2.button("💾 存入資料庫", key=f"save_{idx}"):
+                        msg = db_manager.save_gene(t, strat_name, res['total_ret'], sharpe, params, note)
+                        st.toast(msg, icon="✅")
 
-                # 繪圖
                 fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.7, 0.3])
                 fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name='K線'), row=1, col=1)
                 
-                # 買點標記
                 buy_indices = df.index[pos.diff() == 1]
                 idx_rocket = [ix for ix in buy_indices if reasons[ix] == 1]
                 idx_shield = [ix for ix in buy_indices if reasons[ix] == 2]
@@ -1453,24 +1537,20 @@ def page_ga():
                 if idx_shield: fig.add_trace(go.Scatter(x=idx_shield, y=df.loc[idx_shield, 'Low']*0.99, mode='text+markers', text='🛡️', textposition='bottom center', marker=dict(symbol='diamond', size=12, color='#21C354'), name='早鳥防禦'), row=1, col=1)
                 if idx_std: fig.add_trace(go.Scatter(x=idx_std, y=df.loc[idx_std, 'Low']*0.99, mode='markers', marker=dict(symbol='triangle-up', size=12, color='#00FFFF'), name='標準部隊'), row=1, col=1)
                 
-                # SuperTrend 線
                 st_line = res['st_line']; trend = res['trend']
                 st_bull = st_line.copy(); st_bull[trend == -1] = np.nan
                 st_bear = st_line.copy(); st_bear[trend == 1] = np.nan
                 fig.add_trace(go.Scatter(x=df.index, y=st_bull, mode='lines', line=dict(color='green', width=1), name='支撐'), row=1, col=1)
                 fig.add_trace(go.Scatter(x=df.index, y=st_bear, mode='lines', line=dict(color='red', width=1), name='壓力'), row=1, col=1)
 
-                # 賣點
                 sp = df[(pos.diff() == -1)]; 
                 fig.add_trace(go.Scatter(x=sp.index, y=sp['High']*1.01, mode='markers', marker=dict(symbol='triangle-down', size=12, color='magenta'), name='賣出'), row=1, col=1)
                 
-                # 資產曲線
                 fig.add_trace(go.Scatter(x=df.index, y=cash * res['cum_ret'], mode='lines', line=dict(color='orange'), name='總資產'), row=2, col=1)
                 
                 fig.update_layout(height=600, template="plotly_dark", xaxis_rangeslider_visible=False)
                 st.plotly_chart(fig, use_container_width=True, key=f"c_{idx}")
                 
-                # [V27.11] 圖表下方備註 (Legend)
                 st.info("""
                 **📝 戰術圖示說明：**
                 * 🚀 **先鋒突擊**：偵測到爆量長紅或強勁動能，無視均線特權進場。
@@ -1478,7 +1558,6 @@ def page_ga():
                 * 🔵 **標準部隊**：符合均線多頭排列與技術指標的標準進場點。
                 """)
                 
-                # 交易明細
                 tl = []; cp = 0; ep = 0
                 dates = df.index.strftime('%Y-%m-%d'); closes = df['Close'].values; positions = res['pos'].values
                 for d, close, np_ in zip(dates, closes, positions):
@@ -1495,10 +1574,9 @@ def page_ga():
                     cp = np_
                 
                 if tl: st.dataframe(pd.DataFrame(tl).style.applymap(highlight_trade_status, subset=['損益']), use_container_width=True, key=f"t_{idx}")
-
 # ==========================================
 # 4. 主程式入口
 # ==========================================
 PAGES = {"🤖 AI 總司令選股": page_ai_selector, "⚡ 全能達人戰情室": page_dashboard, "🧬 PyGAD 策略進化": page_ga}
-st.sidebar.title("⚡ AI 戰情室 V32.0"); st.sidebar.caption("相容修復 | JSON完美")
+st.sidebar.title("⚡ AI 戰情室 V33.6"); st.sidebar.caption("精簡優化 | RAG核心 | 資料庫")
 sel = st.sidebar.radio("功能模組", list(PAGES.keys())); PAGES[sel]()
