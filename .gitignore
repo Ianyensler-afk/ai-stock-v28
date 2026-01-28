@@ -1,0 +1,11 @@
+# .gitignore 內容
+# 忽略 Streamlit 密碼檔 (最重要！)
+.streamlit/secrets.toml
+
+# 忽略 Python 編譯檔與快取
+__pycache__/
+*.pyc
+
+# 忽略本地資料庫與設定 (視需求)
+watchlist.json
+*.db
