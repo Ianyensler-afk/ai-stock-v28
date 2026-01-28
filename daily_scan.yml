@@ -1,35 +1,34 @@
-name: Daily Stock Scan & Sheet Sync
+name: AI Daily Scan & Report
 
 on:
   schedule:
-    # 每天 UTC 10:00 = 台灣 18:00
-    # 1-5 代表週一到週五
+    # UTC 10:00 = 台灣時間 18:00 (週一至週五)
     - cron: '0 10 * * 1-5'
-  workflow_dispatch: # 手動觸發按鈕
+  workflow_dispatch: # 允許手動按按鈕執行測試
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v3
     
-    - name: Set up Python
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      
+    - name: Set up Python 3.10
       uses: actions/setup-python@v4
       with:
-        python-version: '3.9'
+        python-version: '3.10'
         
     - name: Install dependencies
-      # 記得安裝 gspread, oauth2client, pytz
       run: |
-        pip install pandas yfinance lxml gspread oauth2client pytz
+        python -m pip install --upgrade pip
+        pip install yfinance pandas numpy
         
-    - name: Run Daily Report
+    - name: Run Scan Script
       env:
+        # 從 GitHub Secrets 讀取密碼
         EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
         EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-        EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
-        GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
-        GOOGLE_SHEET_URL: ${{ secrets.GOOGLE_SHEET_URL }}
+        EMAIL_RECEIVER: ${{ secrets.EMAIL_SENDER }} # 預設寄給自己，也可另設 Secret
       run: |
-        # ⚠️ 這裡原本是 autobot.py，請改成您的正確檔名
         python daily_report.py
