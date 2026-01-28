@@ -1,0 +1,32 @@
+name: Daily Stock Scan & Sheet Sync
+
+on:
+  schedule:
+    # 每天 UTC 10:00 = 台灣 18:00 (週一至週五)
+    - cron: '0 10 * * 1-5'
+  workflow_dispatch: # 允許手動按按鈕測試
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+
+    - name: Install dependencies
+      run: |
+        pip install pandas yfinance lxml gspread oauth2client pytz
+
+    - name: Run Daily Report
+      env:
+        EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+        EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+        GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+        GOOGLE_SHEET_URL: ${{ secrets.GOOGLE_SHEET_URL }}
+      run: |
+        python daily_report.py
