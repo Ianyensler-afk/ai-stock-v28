@@ -13,14 +13,15 @@ from datetime import datetime
 import pytz
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+import requests # 新增 requests 來處理 Session
 
 # 忽略警告
 warnings.filterwarnings("ignore")
 
 # ==========================================
-# 1. 設定區 & 載入區 (維持您已成功的設定)
+# 1. 設定區 & 載入區
 # ==========================================
-print("🔍 [系統] 初始化設定...")
+print("🔍 [系統] 初始化設定 (V33.9 忍者潛行版)...")
 EMAIL_SENDER = os.environ.get("EMAIL_SENDER")
 EMAIL_PASSWORD = os.environ.get("EMAIL_PASSWORD")
 EMAIL_RECEIVER = os.environ.get("EMAIL_RECEIVER", EMAIL_SENDER)
@@ -38,26 +39,54 @@ if os.path.exists("sector_db.json"):
         print(f"❌ [錯誤] JSON 讀取失敗: {e}")
 
 # ==========================================
-# 2. 核心功能 (加入除錯訊息)
+# 2. 核心功能 (偽裝瀏覽器)
 # ==========================================
+
+# [新增] 建立一個偽裝成 Chrome 瀏覽器的 Session
+def get_session():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Referer": "https://finance.yahoo.com/"
+    })
+    return session
+
 def get_stock_data(ticker):
-    try:
-        # [修改] 使用 Ticker 但不做任何處理，直接抓歷史資料
-        # 有時候 Yahoo 會擋特定 User-Agent，這裡依賴 yfinance 的自動處理
-        stock = yf.Ticker(ticker)
-        df = stock.history(period="5d")
-        
-        if df.empty:
-            # 回傳空值前，印出一個失敗標記 (僅印出前幾個避免洗版，這裡簡化處理)
-            return pd.DataFrame()
-        return df
-    except Exception as e:
-        print(f"❌ [下載錯誤] {ticker}: {e}")
-        return pd.DataFrame()
+    # 重試機制
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # 隨機延遲，模仿人類行為
+            time.sleep(random.uniform(1.0, 2.5)) 
+            
+            # 使用偽裝 Session
+            session = get_session()
+            stock = yf.Ticker(ticker, session=session)
+            
+            # 抓取數據
+            df = stock.history(period="5d")
+            
+            if df.empty:
+                return pd.DataFrame()
+            return df
+            
+        except Exception as e:
+            err_msg = str(e)
+            if "Too Many Requests" in err_msg or "429" in err_msg:
+                # 如果被擋，休息久一點 (15秒) 再重試
+                print(f"⚠️ [流量管制] {ticker} 被擋，休息 15 秒後重試... ({attempt+1}/{max_retries})")
+                time.sleep(15)
+            else:
+                # 其他錯誤，稍微休息
+                time.sleep(2)
+    
+    return pd.DataFrame()
 
 def calculate_indicators(df):
     try:
-        if len(df) < 30: return df # 放寬標準到 30 天
+        if len(df) < 30: return df
         df = df.copy()
         df['MA20'] = df['Close'].rolling(20).mean()
         df['MA60'] = df['Close'].rolling(60).mean()
@@ -79,17 +108,11 @@ def calculate_indicators(df):
 
 def process_stock_task(ticker):
     try:
-        # 增加隨機延遲，避免太快被擋
-        time.sleep(random.uniform(0.1, 0.5))
-        
         df = get_stock_data(ticker)
         
-        # [偵錯] 如果是空的，這裡會被跳過
         if df.empty or len(df) < 20: 
-            # 這裡不 return None，而是回傳一個錯誤標記，讓我們知道它是因為沒資料
             return {"status": "fail", "code": ticker, "reason": "Empty/No Data"}
         
-        # 判斷日期
         last_date = df.index[-1].date()
         today_date = datetime.now(TW_TZ).date()
         is_today = (last_date == today_date)
@@ -116,7 +139,6 @@ def process_stock_task(ticker):
     except Exception as e:
         return {"status": "fail", "code": ticker, "reason": str(e)}
 
-# ... (save_to_google_sheet 和 send_email 維持不變，省略以節省空間) ...
 def save_to_google_sheet(data_list):
     if not SHEET_CREDENTIALS or not SHEET_URL: return
     try:
@@ -125,9 +147,12 @@ def save_to_google_sheet(data_list):
         client = gspread.authorize(creds)
         sheet = client.open_by_url(SHEET_URL).sheet1
         scan_time = datetime.now(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")
-        rows = [[scan_time, i['代號'], i['總分'], i['現價'], i['日期'], i['資料狀態']] for i in data_list]
+        
+        # [修改] 為了避免 Sheet 寫入過慢，這裡只寫入前 100 名
+        top_100 = data_list[:100]
+        rows = [[scan_time, i['代號'], i['總分'], i['現價'], i['日期'], i['資料狀態']] for i in top_100]
         sheet.append_rows(rows)
-        print(f"✅ Google Sheet 寫入 {len(rows)} 筆")
+        print(f"✅ Google Sheet 寫入 Top {len(rows)} 筆")
     except Exception as e: print(f"❌ Sheet Error: {e}")
 
 def send_email(subject, html_content):
@@ -158,45 +183,37 @@ if __name__ == "__main__":
             for t in t_list: all_tickers.add(t)
     target_list = sorted(list(all_tickers))
     
-    # [偵錯] 印出清單數量，確認 JSON 解析是否有問題
     print(f"📋 準備掃描清單，共 {len(target_list)} 檔...")
-    if len(target_list) == 0:
-        print("❌ 錯誤：目標清單為空！請檢查 sector_db.json 的結構。")
-        exit()
+    if len(target_list) == 0: exit()
 
-    # 2. 掃描 (降低併發數，避免瞬間被封鎖)
+    # 2. 掃描
     results = []
-    fail_count = 0
-    fail_reasons = []
-
-    print("🚀 開始執行 ThreadPool (Max Workers=4)...")
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    
+    # [關鍵修改] 將 Workers 降到 2，雖然慢但不會被擋
+    # 如果還是失敗，請改成 max_workers=1 (完全單線程)
+    workers = 2 
+    print(f"🚀 開始執行 ThreadPool (Max Workers={workers}, 慢速穩定模式)...")
+    
+    with ThreadPoolExecutor(max_workers=workers) as executor:
         future_to_ticker = {executor.submit(process_stock_task, t): t for t in target_list}
         for i, future in enumerate(as_completed(future_to_ticker)):
             res = future.result()
             
-            # 每 50 檔回報一次進度，確認程式有在跑
-            if i % 50 == 0:
+            # 每 20 檔回報一次
+            if i % 20 == 0:
                 print(f"⏳ 進度: {i}/{len(target_list)} (目前成功: {len(results)})")
 
             if res and res['status'] == 'ok':
                 results.append(res)
-            else:
-                fail_count += 1
-                if res and len(fail_reasons) < 5: # 只記錄前 5 個錯誤原因
-                    fail_reasons.append(f"{res['code']}: {res['reason']}")
 
-    print(f"🛑 掃描結束。成功: {len(results)} | 失敗: {fail_count}")
+    print(f"🛑 掃描結束。成功: {len(results)}")
     
-    if fail_reasons:
-        print("🔍 部分失敗原因範例:", fail_reasons)
-
     # 3. 處理結果
     if results:
         df_res = pd.DataFrame(results).sort_values("總分", ascending=False)
         top_10 = df_res.head(10)
         
-        # 存檔與寄信 (維持不變)
+        # 存檔與寄信
         save_to_google_sheet(df_res.to_dict('records'))
         
         champ = top_10.iloc[0]
@@ -215,4 +232,4 @@ if __name__ == "__main__":
         """
         send_email(f"AI 戰報: 冠軍 {champ['代號']}", email_html)
     else:
-        print("❌ 無有效掃描結果，不寄信。")
+        print("❌ 無有效掃描結果")
