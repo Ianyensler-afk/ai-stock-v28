@@ -1,9 +1,12 @@
-name: AI Daily Scan & Report
+name: Daily Stock Scan & Sheet Sync
 
 on:
   schedule:
-    - cron: '15 10 * * 1-5' # 18:35 (避開尖峰，通常會準時觸發)
-  workflow_dispatch: # 允許手動按按鈕執行測試
+    # 說明：GitHub 使用 UTC 時間
+    # UTC 10:45 = 台灣時間 18:45 (週一至週五)
+    - cron: '45 10 * * 1-5'
+    
+  workflow_dispatch: # 保留手動執行按鈕
 
 jobs:
   build:
@@ -23,12 +26,10 @@ jobs:
         python -m pip install --upgrade pip
         pip install yfinance pandas numpy
         
-    - name: Run Scan Script
+    - name: Run Daily Report
       env:
-        # 從 GitHub Secrets 讀取密碼
         EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
         EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-        EMAIL_RECEIVER: ${{ secrets.EMAIL_SENDER }} # 預設寄給自己，也可另設 Secret
+        EMAIL_RECEIVER: ${{ secrets.EMAIL_SENDER }}
       run: |
         python daily_report.py
-
