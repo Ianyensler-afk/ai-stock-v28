@@ -22,16 +22,15 @@ jobs:
         python-version: '3.9'
         
     # --- 請從這裡開始複製覆蓋 ---
-    - name: Install and Run
+    - name: Run Analysis and Report
       run: |
-        echo "⏳ 開始安裝套件..."
-        python -m pip install --upgrade pip
+        echo "=== 開始安裝套件 ==="
         pip install pandas numpy yfinance matplotlib
         
-        echo "📋 檢查套件清單 (除錯用)..."
+        echo "=== 檢查安裝清單 ==="
         pip list | grep matplotlib
         
-        echo "🚀 執行日報程式..."
+        echo "=== 執行 Python 程式 ==="
         python daily_report.py
         
     - name: Run Daily Report
@@ -41,6 +40,7 @@ jobs:
         EMAIL_RECEIVER: ${{ secrets.EMAIL_SENDER }}
       run: |
         python daily_report.py
+
 
 
 
