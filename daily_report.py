@@ -8,6 +8,11 @@ import logging
 import time
 import io
 import base64
+import base64
+# --- [新增] 設定 Matplotlib 後端為 Agg (非互動模式) ---
+import matplotlib
+matplotlib.use('Agg') 
+# ---------------------------------------------------
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from datetime import datetime
@@ -309,3 +314,4 @@ if __name__ == "__main__":
     res = run_scan_turbo()
     if res:
         send_email(res[0], res[1], res[2])
+
