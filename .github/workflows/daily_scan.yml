@@ -20,9 +20,13 @@ jobs:
       with:
         python-version: '3.9'
 
-    # === 這裡是關鍵修正 ===
-    # 安裝與執行寫在同一個區塊，保證環境一致
     - name: Install and Run Report (Fixed)
+      # === [關鍵修正] 這裡要把 Secrets 注入給環境變數 ===
+      env:
+        EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+        EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+      # ===============================================
       run: |
         echo "Step 1: Upgrading pip..."
         python -m pip install --upgrade pip
