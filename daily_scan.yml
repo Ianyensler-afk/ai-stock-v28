@@ -1,18 +1,17 @@
-name: Daily Stock Scan & Sheet Sync
+name: Daily Stock Scan
 
 on:
+  push:
+    branches: [ "main" ]
   schedule:
-    # 說明：GitHub 使用 UTC 時間
-    # UTC 10:45 = 台灣時間 18:45 (週一至週五)
-    - cron: '45 10 * * 1-5'
-    
-  workflow_dispatch: # 保留手動執行按鈕
+    - cron: '45 10 * * 1-5'  # 台灣時間 18:45 (UTC 10:45)
+  workflow_dispatch:      # 允許手動按鈕觸發
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
-steps:
+    steps:
     - name: Check out code
       uses: actions/checkout@v3
 
@@ -21,32 +20,17 @@ steps:
       with:
         python-version: '3.9'
 
-    - name: Install Dependencies and Run Report
+    # === 這裡是關鍵修正 ===
+    - name: Install and Run Report (Fixed)
       run: |
         echo "Step 1: Upgrading pip..."
         python -m pip install --upgrade pip
-          
+        
         echo "Step 2: Installing libraries..."
         pip install pandas numpy yfinance matplotlib
-          
-        echo "Step 3: Verifying installation..."
+        
+        echo "Step 3: Checking installation..."
         pip list | grep matplotlib
-          
+        
         echo "Step 4: Running Python script..."
         python daily_report.py
-        
-    - name: Run Daily Report
-      env:
-        EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
-        EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-        EMAIL_RECEIVER: ${{ secrets.EMAIL_SENDER }}
-      run: |
-        python daily_report.py
-
-
-
-
-
-
-
-
