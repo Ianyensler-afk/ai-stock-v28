@@ -1,32 +1,37 @@
-name: Daily Stock Scan & Sheet Sync
+name: Daily Stock Scan
 
 on:
+  push:
+    branches: [ "main" ]
   schedule:
-    # 每天 UTC 10:00 = 台灣 18:00 (週一至週五)
-    - cron: '0 10 * * 1-5'
-  workflow_dispatch: # 允許手動按按鈕測試
+    - cron: '45 10 * * 1-5'  # 台灣時間 18:45 (UTC 10:45)
+  workflow_dispatch:      # 允許手動按鈕觸發
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-    - uses: actions/checkout@v3
+    - name: Check out code
+      uses: actions/checkout@v3
 
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.9'
 
-    - name: Install dependencies
+    # === 這裡是關鍵修正 ===
+    # 安裝與執行寫在同一個區塊，保證環境一致
+    - name: Install and Run Report (Fixed)
       run: |
-        pip install pandas yfinance lxml gspread oauth2client pytz
-
-    - name: Run Daily Report
-      env:
-        EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
-        EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-        EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
-        GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
-        GOOGLE_SHEET_URL: ${{ secrets.GOOGLE_SHEET_URL }}
-      run: |
+        echo "Step 1: Upgrading pip..."
+        python -m pip install --upgrade pip
+        
+        echo "Step 2: Installing libraries..."
+        pip install pandas numpy yfinance matplotlib
+        
+        echo "Step 3: Checking installation..."
+        pip list | grep matplotlib
+        
+        echo "Step 4: Running Python script..."
         python daily_report.py
