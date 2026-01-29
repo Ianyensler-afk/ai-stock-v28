@@ -11,26 +11,28 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    
-    steps:
+
+steps:
     - name: Check out code
       uses: actions/checkout@v3
-      
+
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.9'
-        
-    # --- 請從這裡開始複製覆蓋 ---
-    - name: Run Analysis and Report
+
+    - name: Install Dependencies and Run Report
       run: |
-        echo "=== 開始安裝套件 ==="
+        echo "Step 1: Upgrading pip..."
+        python -m pip install --upgrade pip
+          
+        echo "Step 2: Installing libraries..."
         pip install pandas numpy yfinance matplotlib
-        
-        echo "=== 檢查安裝清單 ==="
+          
+        echo "Step 3: Verifying installation..."
         pip list | grep matplotlib
-        
-        echo "=== 執行 Python 程式 ==="
+          
+        echo "Step 4: Running Python script..."
         python daily_report.py
         
     - name: Run Daily Report
@@ -40,6 +42,7 @@ jobs:
         EMAIL_RECEIVER: ${{ secrets.EMAIL_SENDER }}
       run: |
         python daily_report.py
+
 
 
 
