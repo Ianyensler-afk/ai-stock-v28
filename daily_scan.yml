@@ -21,6 +21,7 @@ jobs:
         python-version: '3.9'
 
     # === 這裡是關鍵修正 ===
+    # 安裝與執行寫在同一個區塊，保證環境一致
     - name: Install and Run Report (Fixed)
       run: |
         echo "Step 1: Upgrading pip..."
