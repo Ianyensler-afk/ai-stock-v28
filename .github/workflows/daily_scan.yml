@@ -37,7 +37,7 @@ jobs:
         
         echo "Step 2: Installing libraries..."
         # 注意這裡補上了 gspread 和 oauth2client
-        pip install yfinance pandas numpy matplotlib gspread oauth2client twstock
+        pip install yfinance pandas numpy matplotlib gspread oauth2client twstock lxml
         
         echo "Step 3: Checking installation..."
         pip list | grep gspread
