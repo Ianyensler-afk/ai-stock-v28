@@ -223,14 +223,31 @@ def run_scan_turbo():
             time.sleep(1)
         except: continue
 
+# ... (前面的程式碼不變) ...
+
     if not results: return None
 
-    # 排序：分數高優先
-    df_res = pd.DataFrame(results).sort_values("總分", ascending=False)
+    # 轉為 DataFrame
+    df_res = pd.DataFrame(results)
+
+    # [修正 B] 超級排序邏輯
+    # 1. 總分 (降冪)
+    # 2. 漲跌幅 (降冪) -> 這樣 100 分俱樂部裡，漲最多的會排第一
+    # 3. 成交量 (降冪) -> 如果漲幅也一樣，量大的贏
+    df_res = df_res.sort_values(
+        by=["總分", "漲跌幅", "成交量"], 
+        ascending=[False, False, False]
+    )
     
-    # 抓取冠軍資料畫圖
+    # [修正 C] 確保寫入 Excel 的代號也不會有 'O'
+    # 這樣你的 Google Sheet 就不會出現 '4542O' 這種怪代號
+    df_res['代號'] = df_res['代號'].astype(str).apply(lambda x: x.replace(".TW", "").replace(".TWO", "").rstrip('O'))
+    
+    # 抓取冠軍 (現在這個冠軍會非常穩定了)
     top_ticker = df_res.iloc[0]['代號']
     top_ticker_tw = f"{top_ticker}.TW"
+
+    # ... (後面的程式碼不變) ...
     try:
         champion_df = yf.download(top_ticker_tw, period="6mo", progress=False)
     except: pass
@@ -395,5 +412,6 @@ if __name__ == "__main__":
         
         # 2. 更新 Google Sheet
         update_google_sheet(df_results)
+
 
 
