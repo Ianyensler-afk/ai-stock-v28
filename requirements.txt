@@ -8,3 +8,5 @@ scikit-learn
 pygad
 matplotlib
 mplfinance
+gspread
+oauth2client
