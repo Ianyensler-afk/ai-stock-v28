@@ -36,7 +36,7 @@ jobs:
         python -m pip install --upgrade pip
         
         echo "Step 2: Installing libraries..."
-        # === [關鍵修正 2] 補上 gspread 和 oauth2client ===
+        # 注意這裡補上了 gspread 和 oauth2client
         pip install pandas numpy yfinance matplotlib gspread oauth2client
         
         echo "Step 3: Checking installation..."
