@@ -29,18 +29,24 @@ APP_BASE_URL = "https://ai-stock-v28-izt7hannvryvbk5udoeq22.streamlit.app/"
 # ==========================================
 # 0. 輔助功能：載入股票名稱 (升級版)
 # ==========================================
+# [修正 A] 更強的名稱清洗函式
 def get_stock_name(stock_id):
     """
     優先使用 twstock 庫查詢即時名稱，
-    自動去除 .TW, .TWO 以及異常的 'O' 後綴
+    自動去除 .TW, .TWO 以及異常的 'O' 後綴以提高辨識率
     """
     try:
-        # [修正] 增加 rstrip('O') 去除尾部的 O
-        clean_id = stock_id.replace(".TW", "").replace(".TWO", "").rstrip('O')
+        # 強制轉字串並轉大寫
+        s_id = str(stock_id).upper()
         
+        # 關鍵修正：使用 rstrip('O') 去除尾部多餘的 O
+        clean_id = s_id.replace(".TW", "").replace(".TWO", "").rstrip('O')
+        
+        # 查詢 twstock
         if clean_id in twstock.codes:
             return twstock.codes[clean_id].name
-        return clean_id
+            
+        return clean_id # 真的查不到才回傳代號
     except:
         return stock_id
 
@@ -389,4 +395,5 @@ if __name__ == "__main__":
         
         # 2. 更新 Google Sheet
         update_google_sheet(df_results)
+
 
