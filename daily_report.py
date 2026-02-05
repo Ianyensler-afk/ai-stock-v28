@@ -8,8 +8,10 @@ import logging
 import time
 import io
 import base64
-import base64
-# --- [新增] 設定 Matplotlib 後端為 Agg (非互動模式) ---
+import gspread  # [新增] Google Sheets 操作套件
+from oauth2client.service_account import ServiceAccountCredentials # [新增] 驗證套件
+
+# --- 設定 Matplotlib 後端為 Agg (非互動模式) ---
 import matplotlib
 matplotlib.use('Agg') 
 # ---------------------------------------------------
@@ -23,7 +25,7 @@ from email.mime.image import MIMEImage
 # 設定 Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# 設定您的 Streamlit App 網址 (請修改這裡！)
+# 設定您的 Streamlit App 網址
 APP_BASE_URL = "https://ai-stock-v28-izt7hannvryvbk5udoeq22.streamlit.app/" 
 
 # ==========================================
@@ -310,8 +312,64 @@ def send_email(df_res, champion_df, top_ticker):
     except Exception as e:
         logging.error(f"❌ Email 發送失敗: {str(e)}")
 
+# ==========================================
+# 5. [新增] 寫入 Google Sheet (儲存 Top 20)
+# ==========================================
+def update_google_sheet(df_res):
+    logging.info("📈 正在將數據寫入 Google Sheet...")
+    
+    # 讀取 Secret (請確保 GitHub Secret 名稱正確)
+    json_creds = os.environ.get('GOOGLE_SHEETS_CREDENTIALS')
+    sheet_url = os.environ.get('GOOGLE_SHEET_URL')
+    
+    if not json_creds or not sheet_url:
+        logging.error("❌ 找不到 Google Sheet 設定，跳過寫入。")
+        return
+
+    try:
+        # 1. 驗證與連線
+        creds_dict = json.loads(json_creds)
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        client = gspread.authorize(creds)
+        
+        # 2. 開啟 Sheet
+        sheet = client.open_by_url(sheet_url).sheet1
+        
+        # 3. 準備資料 (取 Top 20)
+        top_20 = df_res.head(20).copy()
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        
+        rows_to_append = []
+        for _, row in top_20.iterrows():
+            # 轉換為 Python 原生型態，避免 numpy 錯誤
+            rows_to_append.append([
+                today_str,                      # Date
+                str(row['代號']),               # Stock ID
+                str(row['名稱']),               # Name
+                float(row['現價']),             # Close Price
+                int(row['總分']),               # Score
+                float(row['RSI']),              # RSI
+                str(row['籌碼']),               # Chip Status
+                str(row['趨勢'])                # Trend
+            ])
+            
+        # 4. 寫入資料
+        if rows_to_append:
+            sheet.append_rows(rows_to_append)
+            logging.info(f"✅ 成功寫入 {len(rows_to_append)} 筆資料到 Google Sheet")
+            
+    except Exception as e:
+        logging.error(f"❌ 寫入 Google Sheet 失敗: {str(e)}")
+
+# ==========================================
+# 主程式入口
+# ==========================================
 if __name__ == "__main__":
     res = run_scan_turbo()
     if res:
+        # 1. 發送信件
         send_email(res[0], res[1], res[2])
-
+        
+        # 2. [新增] 同步寫入 Google Sheet
+        update_google_sheet(res[0])
