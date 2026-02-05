@@ -7,16 +7,14 @@ import json
 import logging
 import time
 import io
-import base64
-import gspread  # [新增] Google Sheets 操作套件
-from oauth2client.service_account import ServiceAccountCredentials # [新增] 驗證套件
+import gspread
+import twstock  # [新增] 用於抓取台股名稱
+from oauth2client.service_account import ServiceAccountCredentials
 
 # --- 設定 Matplotlib 後端為 Agg (非互動模式) ---
 import matplotlib
 matplotlib.use('Agg') 
-# ---------------------------------------------------
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -29,69 +27,81 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 APP_BASE_URL = "https://ai-stock-v28-izt7hannvryvbk5udoeq22.streamlit.app/" 
 
 # ==========================================
-# 0. 輔助功能：載入股票名稱
+# 0. 輔助功能：載入股票名稱 (升級版)
 # ==========================================
-STOCK_MAP = {}
-if os.path.exists("stock_names.json"):
+def get_stock_name(stock_id):
+    """
+    優先使用 twstock 庫查詢即時名稱，
+    如果失敗則回傳代號。
+    """
     try:
-        with open("stock_names.json", "r", encoding="utf-8") as f:
-            STOCK_MAP = json.load(f)
-    except: pass
-
-def get_name(ticker):
-    # 移除 .TW/.TWO
-    clean_t = str(ticker).replace(".TW", "").replace(".TWO", "")
-    return STOCK_MAP.get(clean_t, clean_t)
+        # 移除 .TW 或 .TWO 以便查詢
+        clean_id = stock_id.replace(".TW", "").replace(".TWO", "")
+        if clean_id in twstock.codes:
+            return twstock.codes[clean_id].name
+        return clean_id
+    except:
+        return stock_id
 
 # ==========================================
-# 1. 核心指標計算 (改為 100 分制)
+# 1. 核心指標計算 (含技術指標與籌碼)
 # ==========================================
 def calculate_score_batch(df):
     try:
         if len(df) < 60: return None
         
-        # 基礎計算
+        # --- 基礎數據 ---
         close = df['Close']
+        open_price = df['Open']
+        vol = df['Volume']
+        
+        # --- 技術指標計算 ---
+        # 1. 均線
         ma20 = close.rolling(20).mean()
         ma60 = close.rolling(60).mean()
-        vol = df['Volume']
         vol_ma20 = vol.rolling(20).mean()
         
-        # MACD
+        # 2. MACD
         exp12 = close.ewm(span=12, adjust=False).mean()
         exp26 = close.ewm(span=26, adjust=False).mean()
         macd = exp12 - exp26
         signal = macd.ewm(span=9, adjust=False).mean()
+        macd_hist = macd - signal # 柱狀圖
         
-        # RSI
+        # 3. RSI
         delta = close.diff()
         gain = (delta.where(delta > 0, 0)).rolling(14).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(14).mean().replace(0, 0.001)
         rsi = 100 - (100 / (1 + gain/loss))
 
-        # OBV
+        # 4. OBV (能量潮)
         obv = (np.sign(close.diff()) * vol).fillna(0).cumsum()
         obv_ma = obv.rolling(20).mean()
         
-        # 取最新值
+        # --- 取最新一筆數值 ---
         last_c = close.iloc[-1]
+        last_o = open_price.iloc[-1]
         last_ma20 = ma20.iloc[-1]
         last_ma60 = ma60.iloc[-1]
         last_vol = vol.iloc[-1]
         last_vol_ma = vol_ma20.iloc[-1]
         last_macd = macd.iloc[-1]
         last_sig = signal.iloc[-1]
+        last_hist = macd_hist.iloc[-1]
         last_rsi = rsi.iloc[-1]
         last_obv = obv.iloc[-1]
         last_obv_ma = obv_ma.iloc[-1]
         
+        # 計算漲跌幅 (%)
+        pct_change = ((last_c - df['Close'].iloc[-2]) / df['Close'].iloc[-2]) * 100
+
         # --- 評分邏輯 (滿分 100) ---
         score = 0
         
         # 1. 趨勢面 (40分)
         if last_c > last_ma20: score += 15
         if last_c > last_ma60: score += 15
-        if last_ma20 > last_ma60: score += 10 # 均線多排
+        if last_ma20 > last_ma60: score += 10 
         
         # 2. 動能面 (30分)
         if last_macd > last_sig: score += 15
@@ -102,14 +112,18 @@ def calculate_score_batch(df):
         if last_vol > last_vol_ma: score += 15
         
         # 籌碼判斷 (簡易版：量增價漲=吸籌)
-        change = (last_c - df['Open'].iloc[-1]) / df['Open'].iloc[-1]
-        force_val = change * last_vol
+        # 註：因 yfinance 無法直接取得分點與法人資料，此處維持以量價關係模擬
+        intra_change = (last_c - last_o) / last_o
+        force_val = intra_change * last_vol
         chip_status = "🔥吸籌" if force_val > 0 else "🤮倒貨" if force_val < 0 else "😐中性"
 
         return {
             "現價": round(last_c, 2),
+            "漲跌幅": round(pct_change, 2),
+            "成交量": int(last_vol),
             "總分": score,
             "RSI": round(last_rsi, 1),
+            "MACD_Hist": round(last_hist, 2), # 新增 MACD 柱狀值
             "籌碼": chip_status,
             "趨勢": "⬆️多" if score >= 60 else "⬇️空"
         }
@@ -121,22 +135,19 @@ def calculate_score_batch(df):
 # ==========================================
 def generate_chart_image(ticker, df):
     try:
-        # 只取最後 60 天
         plot_df = df.tail(60).copy()
         
         plt.figure(figsize=(10, 5))
         plt.style.use('dark_background')
         
-        # 繪製收盤價
         plt.plot(plot_df.index, plot_df['Close'], label='Price', color='cyan', linewidth=2)
         plt.plot(plot_df.index, plot_df['Close'].rolling(20).mean(), label='MA20', color='yellow', linestyle='--', alpha=0.7)
         plt.plot(plot_df.index, plot_df['Close'].rolling(60).mean(), label='MA60', color='magenta', linestyle='--', alpha=0.7)
         
-        plt.title(f"{ticker} ({get_name(ticker)}) Daily Chart", fontsize=14, color='white')
+        plt.title(f"{ticker} Daily Chart", fontsize=14, color='white')
         plt.legend()
         plt.grid(True, alpha=0.2)
         
-        # 轉為 Bytes
         buf = io.BytesIO()
         plt.savefig(buf, format='png', bbox_inches='tight')
         buf.seek(0)
@@ -150,17 +161,21 @@ def generate_chart_image(ticker, df):
 # 3. 批量掃描引擎
 # ==========================================
 def run_scan_turbo():
-    logging.info("🚀 AI 總司令：V35.0 終極掃描 (Top 20 + Deep Link)")
+    logging.info("🚀 AI 總司令：V36.0 終極掃描 (整合版)")
     
-    target_tickers = []
+    # 這裡可以替換成你自己的股票清單邏輯
+    target_tickers = ["2330", "2317", "2454", "2603", "2609", "2615", "3231", "2382", "3008", "3037"]
+    
+    # 嘗試讀取 sector_db (如果有的話)
     if os.path.exists("sector_db.json"):
-        with open("sector_db.json", "r", encoding="utf-8") as f:
-            data = json.load(f)
-            for sector in data.values():
-                for sub in sector.values():
-                    target_tickers.extend(sub)
-    else:
-        target_tickers = ["2330", "2317", "2454", "2308", "2603", "2382", "3231", "3008"]
+        try:
+            with open("sector_db.json", "r", encoding="utf-8") as f:
+                data = json.load(f)
+                target_tickers = []
+                for sector in data.values():
+                    for sub in sector.values():
+                        target_tickers.extend(sub)
+        except: pass
 
     clean_tickers = []
     for t in set(target_tickers):
@@ -172,7 +187,7 @@ def run_scan_turbo():
 
     chunk_size = 100
     results = []
-    champion_df = None # 儲存冠軍的 dataframe 以便畫圖
+    champion_df = None
     
     for i in range(0, len(clean_tickers), chunk_size):
         chunk = clean_tickers[i:i + chunk_size]
@@ -191,8 +206,10 @@ def run_scan_turbo():
                     
                     res = calculate_score_batch(df_t)
                     if res:
-                        res['代號'] = ticker.replace(".TW", "").replace(".TWO", "")
-                        res['名稱'] = get_name(res['代號'])
+                        # 處理代號與名稱
+                        stock_id = ticker.replace(".TW", "").replace(".TWO", "")
+                        res['代號'] = stock_id
+                        res['名稱'] = get_stock_name(stock_id) # 使用 twstock 抓名稱
                         results.append(res)
                         
                 except: continue
@@ -201,9 +218,10 @@ def run_scan_turbo():
 
     if not results: return None
 
+    # 排序：分數高優先
     df_res = pd.DataFrame(results).sort_values("總分", ascending=False)
     
-    # 抓取冠軍的完整資料來畫圖
+    # 抓取冠軍資料畫圖
     top_ticker = df_res.iloc[0]['代號']
     top_ticker_tw = f"{top_ticker}.TW"
     try:
@@ -213,7 +231,7 @@ def run_scan_turbo():
     return df_res, champion_df, top_ticker
 
 # ==========================================
-# 4. Email 發送 (含圖表與連結)
+# 4. Email 發送
 # ==========================================
 def send_email(df_res, champion_df, top_ticker):
     sender = os.environ.get("EMAIL_SENDER")
@@ -222,25 +240,21 @@ def send_email(df_res, champion_df, top_ticker):
 
     if not sender or not password: return
 
-    # 取 Top 20
     top_20 = df_res.head(20)
     top_stock = top_20.iloc[0]
     
-    # 生成表格
     table_html = ""
     for idx, row in top_20.iterrows():
         rank = idx + 1
-        rank_icon = "🥇" if rank==1 else "🥈" if rank==2 else "🥉" if rank==3 else f"{rank}."
-        
-        # Deep Link: 使用 query param ?stock=xxxx
         link = f"{APP_BASE_URL}/?stock={row['代號']}"
-        
-        # 分數顏色
         score_color = "#ff4b4b" if row['總分'] >= 80 else "#ffa500" if row['總分'] >= 60 else "#21c354"
+        
+        # 漲跌幅顏色 (紅漲綠跌)
+        pct_color = "red" if row['漲跌幅'] > 0 else "green" if row['漲跌幅'] < 0 else "black"
         
         table_html += f"""
         <tr style="border-bottom: 1px solid #eee;">
-            <td style="padding:6px;">{rank_icon}</td>
+            <td style="padding:6px;">{rank}</td>
             <td style="padding:6px;">
                 <a href="{link}" style="text-decoration:none; font-weight:bold; color:#007bff;">
                     {row['代號']} {row['名稱']}
@@ -248,11 +262,11 @@ def send_email(df_res, champion_df, top_ticker):
             </td>
             <td style="padding:6px; color:{score_color}; font-weight:bold;">{row['總分']}</td>
             <td style="padding:6px;">{row['現價']}</td>
+            <td style="padding:6px; color:{pct_color};">{row['漲跌幅']}%</td>
             <td style="padding:6px;">{row['籌碼']}</td>
         </tr>
         """
 
-    # 生成冠軍圖表
     chart_img = None
     if champion_df is not None:
         chart_buf = generate_chart_image(top_ticker, champion_df)
@@ -266,26 +280,18 @@ def send_email(df_res, champion_df, top_ticker):
     <html>
     <body style="font-family: Arial, sans-serif; color: #333;">
         <div style="max-width: 600px; margin: auto; padding: 20px; border: 1px solid #ddd; border-radius: 10px;">
-            <h2 style="color: #00adb5; text-align: center;">🚀 V35.0 戰情日報 ({today_str})</h2>
-            
+            <h2 style="color: #00adb5; text-align: center;">🚀 每日戰報 ({today_str})</h2>
             <div style="background-color: #f0f8ff; padding: 15px; border-radius: 5px; text-align: center; margin-bottom: 20px;">
-                <h3>👑 本日冠軍: {top_stock['名稱']} ({top_stock['代號']})</h3>
+                <h3>👑 冠軍: {top_stock['名稱']} ({top_stock['代號']})</h3>
                 <h1 style="color: #d9534f; margin: 5px 0;">{top_stock['總分']} 分</h1>
-                <p>收盤: {top_stock['現價']} | 籌碼: {top_stock['籌碼']}</p>
-                <a href="{APP_BASE_URL}/?stock={top_stock['代號']}" 
-                   style="display:inline-block; padding:10px 20px; background-color:#ff4b4b; color:white; text-decoration:none; border-radius:5px;">
-                   🚀 進入 App 分析
-                </a>
             </div>
-            
             <div style="text-align:center; margin-bottom:20px;">
                 <img src="cid:champion_chart" style="width:100%; max-width:500px; border-radius:5px;">
             </div>
-
             <h3>📊 強勢股 Top 20</h3>
             <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
                 <tr style="background-color: #eee;">
-                    <th>#</th><th>股票</th><th>總分</th><th>現價</th><th>籌碼</th>
+                    <th>#</th><th>股票</th><th>總分</th><th>現價</th><th>漲幅</th><th>籌碼</th>
                 </tr>
                 {table_html}
             </table>
@@ -297,11 +303,9 @@ def send_email(df_res, champion_df, top_ticker):
     msg = MIMEMultipart()
     msg['From'] = f"AI 戰情室 <{sender}>"
     msg['To'] = receiver
-    msg['Subject'] = f"🚀 [V35] 冠軍: {top_stock['名稱']} ({top_stock['總分']}分)"
-    
+    msg['Subject'] = f"🚀 [V36] 冠軍: {top_stock['名稱']} ({top_stock['總分']}分)"
     msg.attach(MIMEText(html_content, 'html'))
-    if chart_img:
-        msg.attach(chart_img)
+    if chart_img: msg.attach(chart_img)
 
     try:
         server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
@@ -313,51 +317,59 @@ def send_email(df_res, champion_df, top_ticker):
         logging.error(f"❌ Email 發送失敗: {str(e)}")
 
 # ==========================================
-# 5. [新增] 寫入 Google Sheet (儲存 Top 20)
+# 5. 寫入 Google Sheet (含標題與新指標)
 # ==========================================
 def update_google_sheet(df_res):
     logging.info("📈 正在將數據寫入 Google Sheet...")
     
-    # 讀取 Secret (請確保 GitHub Secret 名稱正確)
     json_creds = os.environ.get('GOOGLE_SHEETS_CREDENTIALS')
     sheet_url = os.environ.get('GOOGLE_SHEET_URL')
     
     if not json_creds or not sheet_url:
-        logging.error("❌ 找不到 Google Sheet 設定，跳過寫入。")
+        logging.error("❌ 找不到 Google Sheet 設定")
         return
 
     try:
-        # 1. 驗證與連線
         creds_dict = json.loads(json_creds)
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
         creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
         client = gspread.authorize(creds)
         
-        # 2. 開啟 Sheet
         sheet = client.open_by_url(sheet_url).sheet1
         
-        # 3. 準備資料 (取 Top 20)
+        # 檢查是否需要寫入標題 (如果目前是空表)
+        current_data = sheet.get_all_values()
+        if not current_data:
+            headers = [
+                "日期", "代號", "名稱", "收盤價", "漲跌幅(%)", 
+                "總分", "成交量", "RSI(14)", "MACD柱狀", "籌碼狀態", "訊號"
+            ]
+            sheet.append_row(headers)
+            logging.info("📝 已新增標題列")
+
+        # 準備 Top 20 資料
         top_20 = df_res.head(20).copy()
         today_str = datetime.now().strftime("%Y-%m-%d")
         
         rows_to_append = []
         for _, row in top_20.iterrows():
-            # 轉換為 Python 原生型態，避免 numpy 錯誤
             rows_to_append.append([
-                today_str,                      # Date
-                str(row['代號']),               # Stock ID
-                str(row['名稱']),               # Name
-                float(row['現價']),             # Close Price
-                int(row['總分']),               # Score
-                float(row['RSI']),              # RSI
-                str(row['籌碼']),               # Chip Status
-                str(row['趨勢'])                # Trend
+                today_str,
+                str(row['代號']),
+                str(row['名稱']),
+                float(row['現價']),
+                float(row['漲跌幅']), # 新增
+                int(row['總分']),
+                int(row['成交量']),   # 新增
+                float(row['RSI']),
+                float(row['MACD_Hist']), # 新增
+                str(row['籌碼']),
+                str(row['趨勢'])
             ])
             
-        # 4. 寫入資料
         if rows_to_append:
             sheet.append_rows(rows_to_append)
-            logging.info(f"✅ 成功寫入 {len(rows_to_append)} 筆資料到 Google Sheet")
+            logging.info(f"✅ 成功寫入 {len(rows_to_append)} 筆資料")
             
     except Exception as e:
         logging.error(f"❌ 寫入 Google Sheet 失敗: {str(e)}")
@@ -368,8 +380,11 @@ def update_google_sheet(df_res):
 if __name__ == "__main__":
     res = run_scan_turbo()
     if res:
-        # 1. 發送信件
-        send_email(res[0], res[1], res[2])
+        # 解包回傳值
+        df_results, champion_data, top_stock_id = res
         
-        # 2. [新增] 同步寫入 Google Sheet
-        update_google_sheet(res[0])
+        # 1. 發送 Email
+        send_email(df_results, champion_data, top_stock_id)
+        
+        # 2. 更新 Google Sheet
+        update_google_sheet(df_results)
