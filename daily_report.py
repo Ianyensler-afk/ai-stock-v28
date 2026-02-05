@@ -32,11 +32,12 @@ APP_BASE_URL = "https://ai-stock-v28-izt7hannvryvbk5udoeq22.streamlit.app/"
 def get_stock_name(stock_id):
     """
     優先使用 twstock 庫查詢即時名稱，
-    如果失敗則回傳代號。
+    自動去除 .TW, .TWO 以及異常的 'O' 後綴
     """
     try:
-        # 移除 .TW 或 .TWO 以便查詢
-        clean_id = stock_id.replace(".TW", "").replace(".TWO", "")
+        # [修正] 增加 rstrip('O') 去除尾部的 O
+        clean_id = stock_id.replace(".TW", "").replace(".TWO", "").rstrip('O')
+        
         if clean_id in twstock.codes:
             return twstock.codes[clean_id].name
         return clean_id
@@ -388,3 +389,4 @@ if __name__ == "__main__":
         
         # 2. 更新 Google Sheet
         update_google_sheet(df_results)
+
