@@ -4,7 +4,9 @@ on:
   push:
     branches: [ "main" ]
   schedule:
-    - cron: '45 10 * * 1-5'  # 台灣時間 18:45 (UTC 10:45)
+    # 修改說明：UTC 11:45 = 台灣時間 19:45
+    # 原本寫 10:45 是台灣 18:45，若要 19:45 請用下面這行：
+    - cron: '45 11 * * 1-5'
   workflow_dispatch:      # 允許手動按鈕觸發
 
 jobs:
@@ -21,21 +23,24 @@ jobs:
         python-version: '3.9'
 
     - name: Install and Run Report (Fixed)
-      # === [關鍵修正] 這裡要把 Secrets 注入給環境變數 ===
+      # === [關鍵修正 1] 注入 Google Sheets 的 Secrets ===
       env:
         EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
         EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
         EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
-      # ===============================================
+        GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }} # 新增
+        GOOGLE_SHEET_URL: ${{ secrets.GOOGLE_SHEET_URL }}                   # 新增
+      # ====================================================
       run: |
         echo "Step 1: Upgrading pip..."
         python -m pip install --upgrade pip
         
         echo "Step 2: Installing libraries..."
-        pip install pandas numpy yfinance matplotlib
+        # === [關鍵修正 2] 補上 gspread 和 oauth2client ===
+        pip install pandas numpy yfinance matplotlib gspread oauth2client
         
         echo "Step 3: Checking installation..."
-        pip list | grep matplotlib
+        pip list | grep gspread
         
         echo "Step 4: Running Python script..."
         python daily_report.py
